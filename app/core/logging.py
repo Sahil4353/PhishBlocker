@@ -1,10 +1,30 @@
+# app/core/logging.py
+from __future__ import annotations
+
 import logging
+from contextvars import ContextVar
 from logging import Filter, LogRecord
 from typing import Optional
 
 from app.core.config import settings
 
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Include request id in every line (rid=- when not in a request context)
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [rid=%(request_id)s]: %(message)s"
+
+# Context var to carry request id across the request lifecycle
+_request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+
+def set_request_id(rid: Optional[str]) -> None:
+    _request_id_ctx.set(rid)
+
+
+def get_request_id() -> Optional[str]:
+    return _request_id_ctx.get()
+
+
+def clear_request_id() -> None:
+    _request_id_ctx.set(None)
 
 
 class _DisableWhenOff(Filter):
@@ -14,38 +34,42 @@ class _DisableWhenOff(Filter):
         return settings.ENABLE_LOGGING
 
 
+class _RequestIdInjector(Filter):
+    """Ensure every record has a request_id attribute to satisfy the format string."""
+
+    def filter(self, record: LogRecord) -> bool:
+        rid = get_request_id() or "-"
+        if not hasattr(record, "request_id"):
+            setattr(record, "request_id", rid)
+        else:
+            # If something else set it, keep theirs
+            if getattr(record, "request_id", None) in (None, ""):
+                setattr(record, "request_id", rid)
+        return True
+
+
 def setup_logging(level: Optional[str] = None) -> None:
     """
-    Initialize root logging once.
-    Safe to call multiple times (idempotent-ish).
+    Initialize root logging once, idempotently.
     """
-    # If already configured, just ensure our filter exists.
     root = logging.getLogger()
     if not root.handlers:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
-    # Set level from settings or override param
     eff_level = (level or settings.LOG_LEVEL).upper()
-    try:
-        root.setLevel(getattr(logging, eff_level, logging.INFO))
-    except Exception:
-        root.setLevel(logging.INFO)
+    root.setLevel(getattr(logging, eff_level, logging.INFO))
 
-    # Ensure our filter is attached to all handlers
-    flt = _DisableWhenOff()
+    disable_flt = _DisableWhenOff()
+    rid_flt = _RequestIdInjector()
+
     for h in root.handlers:
-        # avoid adding duplicates
+        # Attach filters once
         if not any(isinstance(f, _DisableWhenOff) for f in h.filters):
-            h.addFilter(flt)
+            h.addFilter(disable_flt)
+        if not any(isinstance(f, _RequestIdInjector) for f in h.filters):
+            h.addFilter(rid_flt)
 
 
 def get_logger(name: str) -> logging.Logger:
-    """
-    Get a module-level logger consistently.
-    Usage:
-        from app.core.logging import get_logger
-        logger = get_logger(__name__)
-        logger.info("hello")
-    """
-    setup_logging()  # ensure configured
+    setup_logging()
     return logging.getLogger(name)
