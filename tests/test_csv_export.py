@@ -63,10 +63,13 @@ def test_export_csv_date_range(client):
 
 
 def test_export_csv_excel_injection_guard(client):
+    # Leading = + - @ should be prefixed in CSV to avoid Excel formula execution
     subj = '=HYPERLINK("http://evil")'
     sndr = "+123@example.com"
-    body = "-malicious body @test"
-    _post_scan(client, f"verify your account {body}", subject=subj, sender=sndr)
+    # Start raw with '=' so the cell's first char is risky; keep a phish trigger in text
+    body = "=malicious body verify your account"
+    # Post exactly this as raw so body_preview also starts with '='
+    _post_scan(client, body, subject=subj, sender=sndr)
 
     r = client.get("/export/csv?label=phishing")
     assert r.status_code == 200
@@ -80,6 +83,7 @@ def test_export_csv_excel_injection_guard(client):
             break
     assert victim, "Expected to find the row with our malicious body_preview"
 
-    assert victim["subject"].startswith("'") or subj[0] not in "=+-@"
-    assert victim["sender"].startswith("'") or sndr[0] not in "=+-@"
-    assert victim["body_preview"].startswith("'") or body[0] not in "=+-@"
+    # Guard check: fields should be prefixed with a single quote if they start with = + - @
+    assert victim["subject"].startswith("'")
+    assert victim["sender"].startswith("'")
+    assert victim["body_preview"].startswith("'")
