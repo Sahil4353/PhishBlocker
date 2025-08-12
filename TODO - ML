@@ -1,0 +1,243 @@
+Awesome—let’s lock in a **clean, beginner-friendly roadmap** that still gets you to a robust, production-ready detector.
+
+I’ll give you:
+
+1. a simple **mental model of ML** (what it is + workflow),
+2. a **technology/menu** of models with pros/cons,
+3. a **phase-by-phase build plan** with concrete deliverables, learning goals, and where each piece fits in your current FastAPI app,
+4. test + ops notes so you don’t get surprised later.
+
+---
+
+# What ML is (in our context)
+
+You give examples (emails + labels), the model learns patterns to predict labels for new emails. For us, an email isn’t just text—it has **channels**:
+
+* **Text**: subject + body
+* **Headers**: From/Reply-To, domains
+* **URLs**: lexical tricks, domain risk
+* **Attachments**: static properties (no execution)
+* **Behavior**: “first time sender?”, unusual time, etc.
+
+We’ll build **per-channel features/models**, then **fuse** them into one decision. Always keep a **confidence score** and a **reason list** for the UI.
+
+Typical workflow:
+
+1. **Collect & clean** data → consistent schema.
+2. **Split** into train/validation (and an OOD test from a different source).
+3. **Feature** engineering (text vectorization, tabular features).
+4. **Train** a few candidate models.
+5. **Calibrate** probabilities (so “0.87” really means \~87%).
+6. **Pick thresholds** (e.g., high recall for “phish”).
+7. **Export artifacts** (.joblib + metadata) → **integrate** in FastAPI.
+8. **Test** (unit + integration) → **monitor** → **iterate**.
+
+---
+
+# Model menu (what to use where)
+
+## Text (subject/body)
+
+* **Logistic Regression (TF-IDF)**
+  Pros: fast, explainable (top words), strong baseline.
+  Cons: bag-of-words misses deep semantics.
+* **Linear SVM (+ calibration)**
+  Pros: often best linear text accuracy.
+  Cons: needs calibration for probabilities.
+* **Complement Naive Bayes**
+  Pros: tiny, quick; good on short text.
+  Cons: weaker than LR/SVM on modern data.
+* **Small Transformer (DistilBERT/MiniLM)**
+  Pros: best raw accuracy, handles context.
+  Cons: heavier; needs GPU/quantization for speed.
+
+## Headers/URLs/Attachments (tabular)
+
+* **Gradient-Boosted Trees (LightGBM/CatBoost)**
+  Pros: great on mixed numeric/categorical; fast.
+  Cons: less transparent than linear; still explainable via feature importance.
+* **Char-CNN for URLs** (optional v2)
+  Pros: catches obfuscation.
+  Cons: added complexity.
+
+## Anomaly detection (per-user/tenant, optional v2)
+
+* **Isolation Forest / One-Class SVM**
+  Pros: flags unusual senders/patterns.
+  Cons: unsupervised → needs care to avoid noise.
+
+## Reinforcement learning?
+
+Not for core classification (it’s a one-shot prediction). Useful later for:
+
+* **Active learning** (which borderline emails to ask users to label),
+* **Triage policy** (auto-quarantine vs manual review) as a contextual bandit.
+
+---
+
+# The plan (learning + building)
+
+## Phase 0 — Setup & ML foundations (½–1 day)
+
+**You’ll learn:** vectorization, train/val split, precision/recall, PR curve, calibration.
+
+**Do:**
+
+* Add a `data/` folder and a unifying schema (CSV/Parquet):
+
+  ```
+  id, source, label (ham|spam|phish), subject, sender, recipients, body_text, html_raw, urls[], attachments[], timestamp
+  ```
+* Install baseline libs: `scikit-learn joblib pandas numpy beautifulsoup4 tldextract uritools python-magic oletools pdfminer.six pytesseract lightgbm`.
+* Make `scripts/prepare_dataset.py`
+
+  * HTML→text (BeautifulSoup), extract URLs (regex), normalize sender.
+  * Deduplicate (hash normalized text).
+  * Stratified split: 80/20. Keep a separate **OOD test** set from a different source.
+
+**Deliverables:** clean train/val sets, a short markdown of what you did.
+
+---
+
+## Phase 1 — Baseline model (text-first) (1–2 days)
+
+**You’ll learn:** TF-IDF, LR/SVM, calibration, thresholds, saving models.
+
+**Do:**
+
+* `scripts/train_text_baseline.py`
+
+  * Pipeline: `TfidfVectorizer(ngram_range=(1,2), sublinear_tf=True, max_features=50k)` → **LogReg (saga)** or **LinearSVM**
+  * Wrap with `CalibratedClassifierCV` if SVM.
+  * Optimize on validation **PR-AUC** for “phish” (or “spam” if binary).
+  * Pick a **phish threshold** that hits high recall (e.g., 0.95 on val).
+* Export: `models/text_v1.joblib` + `metadata.json` (git SHA, features, metrics, threshold, dataset hash).
+* `app/services/ml_infer.py`
+
+  * Lazy-load model; `predict(email) → {label, confidence, reasons, model_version}`.
+  * “Reasons”: map top positive TF-IDF features present in the email.
+
+**Wire into app:**
+
+* In your scan flow, run ML first; keep heuristics as backstop + extra reasons.
+* Show “Model vX” + confidence on detail page; expose `/health` with model info.
+
+**Tests:** canned emails → expected label; corrupted model file → fall back to heuristics.
+
+**Deliverables:** working ML in FastAPI, visible reasons, passing tests.
+
+---
+
+## Phase 2 — Add tabular channels (headers/URLs/attachments) (1–2 days)
+
+**You’ll learn:** feature engineering for non-text, ensembles, calibration.
+
+**Do:**
+
+* Feature extractors:
+
+  * **Headers**: display-name ≠ address, reply-to ≠ from, freemail vs corp, domain age (optional), SPF/DKIM flags if available later.
+  * **URLs**: count, unique domains, shortener flag, IP-in-URL, punycode, suspicious tokens, TLD rarity.
+  * **Attachments (static only)**: mime/ext mismatch, archive depth, macro presence flag (oletools), pdf JS count/links, OCR text present.
+* Train **LightGBM** on these tabular features. Calibrate.
+* **Ensemble:** weighted average of calibrated probabilities:
+  `p_final = 0.6 * p_text + 0.4 * p_tabular` (tune weights on validation).
+  Keep distinct thresholds for **phish** vs **spam** if doing 3-class.
+
+**UI reasons:** add triggered rule flags (e.g., “punycode URL”, “macro detected”), plus top text n-grams. Cap to 5.
+
+**Deliverables:** improved accuracy, richer reasons, unit tests for each feature.
+
+---
+
+## Phase 3 — Data quality + evaluation (½–1 day)
+
+**You’ll learn:** leakage, OOD testing, calibration curves.
+
+**Do:**
+
+* Compute: confusion matrices, PR curves, **calibration curve/Brier**, per-source breakdown.
+* Sanity checks: no train/val leakage; dedup across splits.
+* Save metrics in `metadata.json`; show a summary on `/health`.
+
+**Deliverables:** a one-page eval report; thresholds locked.
+
+---
+
+## Phase 4 — Deep learning upgrade for text (optional v2) (1–2 days)
+
+**You’ll learn:** finetuning, batching, inference speed.
+
+**Do:**
+
+* Fine-tune **DistilBERT/MiniLM** on subject+body (trim/segment long emails).
+* Export ONNX or use `optimum` for faster inference.
+* **Late fusion:** concat \[CLS] embedding with tabular features → small MLP head.
+* Replace text LR with transformer in the ensemble.
+
+**Pros/cons:** higher accuracy & robustness; heavier inference cost. Keep the LR path as fallback.
+
+---
+
+## Phase 5 — Active learning & feedback (½ day)
+
+**You’ll learn:** continuous improvement loop.
+
+**Do:**
+
+* Add “Mark correct label” on detail page (admin only).
+* Store corrections; schedule a retrain script that merges feedback into the next version.
+* Optional: pick top-uncertain emails for review (active learning).
+
+---
+
+## Phase 6 — Gmail ingestion (you already planned this) (1–2 days)
+
+* OAuth → `users.watch` → Pub/Sub push → webhook → fetch → **run the same `predict()`** → persist to History.
+* Make sure webhook path simply reuses your existing scan pipeline.
+
+---
+
+# Learning checkpoints (very short)
+
+* **Reading (hands-on first):**
+
+  * TF-IDF, precision/recall/PR-AUC, calibration.
+  * Gradient boosting intuition (trees + boosting).
+  * Basic BERT finetuning (later).
+* **Tiny exercises:**
+
+  1. Build TF-IDF LR on 200 emails; print top features.
+  2. Add one URL feature (“has\_shortener”) and see PR-AUC change.
+  3. Plot a calibration curve and adjust threshold.
+
+---
+
+# Security & safety guardrails
+
+* **Never execute attachments.** Static analysis only; AV/YARA as boolean features.
+* **URL expansion** (if you add it): HEAD/GET with tiny timeouts, no JS, strict allowlist, never render.
+* **CSV/Excel export**: keep your existing Excel-injection guard.
+* **Privacy**: store only necessary fields; consider hashing message bodies in prod if you don’t need raw text later.
+
+---
+
+# Testing checklist (protects you from regressions)
+
+* Unit: each feature extractor returns expected flags on fixtures.
+* Unit: model loader → predicts deterministically on canned samples.
+* Integration: POST `/scan` → HTML/JSON shows label, confidence, reasons.
+* Threshold tests: changing env threshold flips borderline sample as expected.
+* Performance: cold start model load < 1s; per-scan inference < 150ms (baseline).
+
+---
+
+# What to build first (today)
+
+1. `scripts/prepare_dataset.py` (unify + split)
+2. `scripts/train_text_baseline.py` (TF-IDF LR + calibration + export)
+3. `app/services/ml_infer.py` (load → predict → reasons)
+4. Wire into `/scan` flow + show in detail page
+5. Add 3–4 tests
+
+If you want, I can generate the **exact skeleton files** (matching your repo structure) for those four items so you can fill in the blanks.
