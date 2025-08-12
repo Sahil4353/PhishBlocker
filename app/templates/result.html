@@ -1,12 +1,24 @@
-{% extends 'base.html' %}
-{% block content %}
-<h2>Scan Result</h2>
-<div class="card">
-  <p><strong>Label:</strong> {{ label|upper }}</p>
-  <p><strong>Confidence:</strong> {{ '%.2f'|format(confidence) }}</p>
+{% extends "base.html" %}
+{% block title %}Scan Result · PhishBlocker{% endblock %}
 
-  <div class="space"></div>
-  <p><strong>Reasons:</strong></p>
+{% block content %}
+<header style="margin-bottom:1rem;">
+  <h1 style="margin:0;">Scan Result</h1>
+</header>
+
+<section style="background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;padding:1rem;margin-bottom:1rem;">
+  <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;">
+    <strong>Label:</strong>
+    <span style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #e5e5e5;background:#fff;">
+      {{ label|capitalize }}
+    </span>
+    <strong style="margin-left:1rem;">Confidence:</strong>
+    <span>{{ '%.0f'|format((confidence or 0) * 100) }}%</span>
+  </div>
+</section>
+
+<section style="margin-bottom:1rem;">
+  <h2 style="margin:0 0 0.5rem 0;font-size:1.1rem;">Reasons</h2>
   {% if reasons and reasons|length %}
   <ul>
     {% for r in reasons %}
@@ -14,11 +26,16 @@
     {% endfor %}
   </ul>
   {% else %}
-  <p class="muted">No reasons provided.</p>
+  <p style="color:#666;">No reasons recorded.</p>
   {% endif %}
+</section>
 
-  <div class="space"></div>
-  <a class="btn" href="{{ request.url_for('index') }}">Scan another</a>
-  <a class="btn" href="{{ request.url_for('history') }}">Open history</a>
-</div>
+<p style="margin-top:1rem;">
+  {% if scan_id %}
+  <a href="{{ request.url_for('scan_detail_view', scan_id=scan_id) }}">View detail</a> ·
+  <a href="{{ request.url_for('scan_detail', scan_id=scan_id) }}">JSON</a> ·
+  {% endif %}
+  <a href="{{ request.url_for('history') }}">History</a> ·
+  <a href="{{ request.url_for('index') }}">Scan another</a>
+</p>
 {% endblock %}
