@@ -1,0 +1,54 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>History</h2>
+<p class="muted">Total scans: {{ total }} · Page {{ page }} of {{ pages }}</p>
+<div class="space"></div>
+
+{% if scans and scans|length %}
+<table class="table">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Created</th>
+            <th>Subject</th>
+            <th>Sender</th>
+            <th>Label</th>
+            <th>Confidence</th>
+            <th>Preview</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in scans %}
+        <tr>
+            <td>{{ s.id }}</td>
+            <td>{{ (s.created_at|string) if s.created_at is defined else '-' }}</td>
+            <td>{{ s.subject or '-' }}</td>
+            <td>{{ s.sender or '-' }}</td>
+            <td>{{ s.label|upper }}</td>
+            <td>{{ '%.2f'|format(s.confidence or 0.0) }}</td>
+            <td>{{ s.body_preview or '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="space"></div>
+<div class="row">
+    {# Prev button #}
+    {% set prev_disabled = (page <= 1) %} <a class="btn"
+        href="{{ request.url_for('history') }}?page={{ page-1 }}&page_size={{ page_size }}" {% if prev_disabled
+        %}aria-disabled="true" style="pointer-events:none;opacity:.5" {% endif %}>
+        ◀ Prev
+        </a>
+
+        {# Next button #}
+        {% set next_disabled = (page >= pages) %}
+        <a class="btn" href="{{ request.url_for('history') }}?page={{ page+1 }}&page_size={{ page_size }}" {% if
+            next_disabled %}aria-disabled="true" style="pointer-events:none;opacity:.5" {% endif %}>
+            Next ▶
+        </a>
+</div>
+{% else %}
+<p class="muted">No scans yet. <a href="{{ request.url_for('index') }}">Run your first scan →</a></p>
+{% endif %}
+{% endblock %}

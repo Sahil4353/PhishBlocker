@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PhishBlocker</title>
+  <link rel="icon"
+    href="{{ request.url_for('favicon') if request.app.routes|selectattr('name','equalto','favicon')|list else '#' }}">
+  <style>
+    :root {
+      --fg: #111;
+      --muted: #666;
+      --line: #e5e5e5;
+      --bg: #fff;
+      --card: #fafafa;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 2rem;
+      color: var(--fg);
+      background: var(--bg);
+    }
+
+    header {
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    nav a {
+      text-decoration: none;
+      color: #0366d6;
+      padding: .25rem .5rem;
+      border-radius: 6px;
+    }
+
+    nav a.active {
+      background: #e9f2ff;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    input,
+    textarea,
+    select {
+      width: 100%;
+      padding: 10px;
+      margin: .25rem 0 1rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    button,
+    .btn {
+      display: inline-block;
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #f6f8fa;
+      cursor: pointer;
+      text-decoration: none;
+      color: inherit;
+    }
+
+    button:hover,
+    .btn:hover {
+      background: #eef2f6;
+    }
+
+    .card {
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .table th,
+    .table td {
+      border-bottom: 1px solid var(--line);
+      padding: .6rem .5rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .grid {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .row {
+      display: flex;
+      gap: .75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .space {
+      height: .5rem;
+    }
+
+    @media (max-width: 640px) {
+      body {
+        margin: 1rem;
+      }
+    }
+  </style>
+  {% block head_extra %}{% endblock %}
+</head>
+
+<body>
+  <header>
+    <h1 style="margin:0;">PhishBlocker</h1>
+    <nav class="row">
+      {% set p = request.url.path %}
+      <a href="{{ request.url_for('index') }}" class="{% if p == '/' %}active{% endif %}">Scan</a>
+      <a href="{{ request.url_for('history') }}" class="{% if p.startswith('/history') %}active{% endif %}">History</a>
+      <a href="{{ request.url_for('health') }}" class="{% if p == '/health' %}active{% endif %}">Health</a>
+    </nav>
+  </header>
+
+  {% block content %}{% endblock %}
+
+  {% block scripts %}{% endblock %}
+</body>
+
+</html>
