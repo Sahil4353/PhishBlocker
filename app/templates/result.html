@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Scan Result</h2>
+<div class="card">
+  <p><strong>Label:</strong> {{ label|upper }}</p>
+  <p><strong>Confidence:</strong> {{ '%.2f'|format(confidence) }}</p>
+
+  <div class="space"></div>
+  <p><strong>Reasons:</strong></p>
+  {% if reasons and reasons|length %}
+  <ul>
+    {% for r in reasons %}
+    <li>{{ r }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No reasons provided.</p>
+  {% endif %}
+
+  <div class="space"></div>
+  <a class="btn" href="{{ request.url_for('index') }}">Scan another</a>
+  <a class="btn" href="{{ request.url_for('history') }}">Open history</a>
+</div>
+{% endblock %}

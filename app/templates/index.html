@@ -1,0 +1,26 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Quick Scan</h2>
+<p class="muted">Paste the email content below. We’ll run a quick heuristic check (regex-based) and store the result.
+</p>
+<div class="space"></div>
+
+<form method="post" action="{{ request.url_for('scan_email') }}">
+  <!-- Optional: this will be ignored until you wire CSRF in the backend -->
+  {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+
+  <label>Subject <span class="muted">(optional)</span></label>
+  <input type="text" name="subject" placeholder="Subject" />
+
+  <label>Sender <span class="muted">(optional)</span></label>
+  <input type="email" name="sender" placeholder="sender@example.com" />
+
+  <label>Raw Email</label>
+  <textarea name="raw" rows="10" required placeholder="Paste full email body or raw text..."></textarea>
+
+  <div class="row">
+    <button type="submit">Scan</button>
+    <a class="btn" href="{{ request.url_for('history') }}">View history</a>
+  </div>
+</form>
+{% endblock %}
