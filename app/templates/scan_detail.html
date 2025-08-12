@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Scan #{{ scan.id }} · PhishBlocker{% endblock %}
+
+{% block content %}
+<header style="margin-bottom:1rem;">
+    <h1 style="margin:0;">Scan Detail</h1>
+    <p style="color:#666;margin:0.25rem 0 0;">ID: {{ scan.id }} · {{ scan.created_at or "—" }}</p>
+</header>
+
+<section style="background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;padding:1rem;margin-bottom:1rem;">
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;">
+        <strong>Label:</strong>
+        <span style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #e5e5e5;background:#fff;">
+            {{ scan.label|capitalize }}
+        </span>
+        <strong style="margin-left:1rem;">Confidence:</strong>
+        <span>{{ '%.0f'|format((scan.confidence or 0) * 100) }}%</span>
+    </div>
+    <div style="margin-top:0.75rem;color:#444;">
+        <div><strong>Subject:</strong> {{ scan.subject or "(no subject)" }}</div>
+        <div><strong>From:</strong> {{ scan.sender or "(unknown)" }}</div>
+    </div>
+</section>
+
+<section style="margin-bottom:1rem;">
+    <h2 style="margin:0 0 0.5rem 0;font-size:1.1rem;">Reasons</h2>
+    {% if scan.reasons and scan.reasons|length %}
+    <ul>
+        {% for r in scan.reasons %}
+        <li>{{ r }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p style="color:#666;">No reasons recorded.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2 style="margin:0 0 0.5rem 0;font-size:1.1rem;">Body preview</h2>
+    <pre
+        style="white-space:pre-wrap;background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;padding:1rem;max-height:320px;overflow:auto;">{{ scan.body_preview or "" }}</pre>
+</section>
+
+<p style="margin-top:1rem;">
+    <a href="{{ request.url_for('history') }}">← Back to History</a>
+</p>
+{% endblock %}

@@ -1,54 +1,129 @@
-{% extends 'base.html' %}
+{% extends "base.html" %}
+{% block title %}History · PhishBlocker{% endblock %}
+
 {% block content %}
-<h2>History</h2>
-<p class="muted">Total scans: {{ total }} · Page {{ page }} of {{ pages }}</p>
-<div class="space"></div>
+<header style="margin-bottom:1rem;">
+    <h1 style="margin:0;">Scan History</h1>
+    <p style="color:#666;margin:0.25rem 0 0;">
+        Total: {{ total }} · Page {{ page }} of {{ pages }}
+    </p>
+    {% if error %}
+    <p style="color:#b00020;margin-top:0.5rem;">{{ error }}</p>
+    {% endif %}
+</header>
 
-{% if scans and scans|length %}
-<table class="table">
-    <thead>
-        <tr>
-            <th>ID</th>
-            <th>Created</th>
-            <th>Subject</th>
-            <th>Sender</th>
-            <th>Label</th>
-            <th>Confidence</th>
-            <th>Preview</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for s in scans %}
-        <tr>
-            <td>{{ s.id }}</td>
-            <td>{{ (s.created_at|string) if s.created_at is defined else '-' }}</td>
-            <td>{{ s.subject or '-' }}</td>
-            <td>{{ s.sender or '-' }}</td>
-            <td>{{ s.label|upper }}</td>
-            <td>{{ '%.2f'|format(s.confidence or 0.0) }}</td>
-            <td>{{ s.body_preview or '-' }}</td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
+<!-- Export CSV -->
+<section style="margin:0 0 1rem 0; background:#fafafa; border:1px solid #e5e5e5; border-radius:8px; padding:0.75rem;">
+    <form method="get" action="{{ request.url_for('export_csv') }}"
+        style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:end;">
+        <div>
+            <label for="label" style="display:block; font-size:0.9rem; color:#444;">Label</label>
+            <select id="label" name="label" style="padding:0.3rem; border:1px solid #e5e5e5; border-radius:6px;">
+                <option value="">Any</option>
+                <option value="safe">Safe</option>
+                <option value="spam">Spam</option>
+                <option value="phishing">Phishing</option>
+            </select>
+        </div>
+        <div>
+            <label for="date_from" style="display:block; font-size:0.9rem; color:#444;">From (YYYY-MM-DD)</label>
+            <input id="date_from" name="date_from" type="date"
+                style="padding:0.3rem; border:1px solid #e5e5e5; border-radius:6px;" />
+        </div>
+        <div>
+            <label for="date_to" style="display:block; font-size:0.9rem; color:#444;">To (YYYY-MM-DD)</label>
+            <input id="date_to" name="date_to" type="date"
+                style="padding:0.3rem; border:1px solid #e5e5e5; border-radius:6px;" />
+        </div>
+        <div>
+            <button type="submit"
+                style="padding:0.4rem 0.8rem; border:1px solid #e5e5e5; border-radius:6px; background:#fff; cursor:pointer;">
+                Export CSV
+            </button>
+        </div>
+        <div style="font-size:0.85rem; color:#666;">
+            Tip: leave fields empty to export everything.
+        </div>
+    </form>
+</section>
 
-<div class="space"></div>
-<div class="row">
-    {# Prev button #}
-    {% set prev_disabled = (page <= 1) %} <a class="btn"
-        href="{{ request.url_for('history') }}?page={{ page-1 }}&page_size={{ page_size }}" {% if prev_disabled
-        %}aria-disabled="true" style="pointer-events:none;opacity:.5" {% endif %}>
-        ◀ Prev
-        </a>
-
-        {# Next button #}
-        {% set next_disabled = (page >= pages) %}
-        <a class="btn" href="{{ request.url_for('history') }}?page={{ page+1 }}&page_size={{ page_size }}" {% if
-            next_disabled %}aria-disabled="true" style="pointer-events:none;opacity:.5" {% endif %}>
-            Next ▶
-        </a>
-</div>
+{% if scans|length == 0 %}
+<p style="color:#666;">No scans yet. Paste an email on the home page to get started.</p>
 {% else %}
-<p class="muted">No scans yet. <a href="{{ request.url_for('index') }}">Run your first scan →</a></p>
+<div style="overflow:auto;">
+    <table style="width:100%; border-collapse:collapse; border:1px solid #e5e5e5;">
+        <thead>
+            <tr style="background:#fafafa;">
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">ID</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Created</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Subject</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">From</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Label</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Conf.</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Preview</th>
+                <th style="text-align:left;padding:8px;border-bottom:1px solid #e5e5e5;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for scan in scans %}
+            <tr>
+                <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
+                    <a href="{{ request.url_for('scan_detail_view', scan_id=scan.id) }}">#{{ scan.id }}</a>
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
+                    {{ scan.created_at or "—" }}
+                </td>
+                <td
+                    style="padding:8px;border-bottom:1px solid #f0f0f0;max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    <a href="{{ request.url_for('scan_detail_view', scan_id=scan.id) }}">
+                        {{ scan.subject or "(no subject)" }}
+                    </a>
+                </td>
+                <td
+                    style="padding:8px;border-bottom:1px solid #f0f0f0;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    {{ scan.sender or "(unknown)" }}
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
+                    {{ scan.label|capitalize }}
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
+                    {{ '%.0f'|format((scan.confidence or 0) * 100) }}%
+                </td>
+                <td
+                    style="padding:8px;border-bottom:1px solid #f0f0f0;max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#444;">
+                    {{ scan.body_preview or "" }}
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
+                    <a href="{{ request.url_for('scan_detail', scan_id=scan.id) }}">JSON</a> ·
+                    <a href="{{ request.url_for('scan_detail_view', scan_id=scan.id) }}">View</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% set prev_page = page - 1 %}
+{% set next_page = page + 1 %}
+
+<nav style="margin-top:1rem; display:flex; gap:0.5rem; align-items:center;">
+    <a href="{{ request.url_for('history') }}?page=1&page_size={{ page_size }}"
+        style="padding:0.25rem 0.5rem; border:1px solid #e5e5e5; border-radius:6px; text-decoration:none; color:#111;">«
+        First</a>
+    <a href="{{ request.url_for('history') }}?page={{ 1 if prev_page<=0 else prev_page }}&page_size={{ page_size }}"
+        style="padding:0.25rem 0.5rem; border:1px solid #e5e5e5; border-radius:6px; text-decoration:none; color:#111;">‹
+        Prev</a>
+    <span style="color:#666;">Page {{ page }} / {{ pages }}</span>
+    <a href="{{ request.url_for('history') }}?page={{ pages if next_page>pages else next_page }}&page_size={{ page_size }}"
+        style="padding:0.25rem 0.5rem; border:1px solid #e5e5e5; border-radius:6px; text-decoration:none; color:#111;">Next
+        ›</a>
+    <a href="{{ request.url_for('history') }}?page={{ pages }}&page_size={{ page_size }}"
+        style="padding:0.25rem 0.5rem; border:1px solid #e5e5e5; border-radius:6px; text-decoration:none; color:#111;">Last
+        »</a>
+</nav>
 {% endif %}
+
+<p style="margin-top:1rem;">
+    <a href="{{ request.url_for('index') }}">← Back to Scan</a>
+</p>
 {% endblock %}
