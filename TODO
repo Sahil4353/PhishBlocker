@@ -1,155 +1,116 @@
-boom—here’s your fresh snapshot, matching the style you liked.
+boom—fresh snapshot, up to the minute.
 
 # What we’ve accomplished (current state)
 
-* **FastAPI app** with clean app factory + lifespan; routers split by concern:
+* **FastAPI app** with factory + lifespan; routers by concern:
 
-  * `pages` (HTML: `/`, `POST /scan`, `/history`, `/scan/{id}/view`)
-  * `scans` (JSON: `/scan/{id}`, downloads: `/export/csv`)
-  * `debug` (`/health`, `/_debug/scan_count`, `/_debug/cwd`)
+  * `pages` (HTML): `/`, **PRG** `POST /scan → 303 /scan/{id}/view?ok=1`, `/history`, `/scan/{id}/view`
+  * `scans` (JSON & export): `/scan/{id}`, `/export/csv`
+  * `debug`: `/health`, `/_debug/scan_count`, `/_debug/cwd`
 * **Templates/UI**
 
-  * New **Scan Detail (HTML)** page with label, confidence, reasons, body preview.
-  * **History** table with pagination, row → detail links, and **CSV Export form** (label + date filters).
-  * **Result** page now shows **View detail / JSON / History / Scan another** links.
-* **Heuristic classifier** moved to `app/services/heuristics.py` (precompiled regexes, safe guards, logs).
-* **Centralized logging + config** in `app/core`:
+  * **Scan Detail (HTML)** with label, confidence, reasons, body preview
+  * **History** with pagination + CSV export form (label & date filters)
+  * **Result** now links to detail / JSON / history / new scan
+* **Classifier**: heuristics in `app/services/heuristics.py` (precompiled regex, precedence, confidence scaling)
+* **Central logging & request IDs**
 
-  * `ENABLE_LOGGING` (true/false), `LOG_LEVEL`, `ENV` via env vars.
-  * Consistent format, safe filters; one-liner `get_logger(__name__)`.
-* **ORM model (Scan)** already in place; History query avoids loading large `raw`.
-* **DB layer**: dependency with defensive rollback+close; dev startup creates tables.
-* **CSV export** with Excel injection guard and optional filters (`label`, `date_from`, `date_to`).
-* **Error handling**: try/except around every route; graceful fallbacks for pages.
-* **DX**: routes named explicitly (`name="…"`) so `url_for()` is stable; hot pagination fix (querystring).
+  * `app/core/logging.py` + `ENABLE_LOGGING` / `LOG_LEVEL`
+  * `app/core/middleware.py` adds `X-Request-ID` on every response
+* **DB layer**: SQLite with WAL, safe session dependency, auto table create on startup
+* **CSV export (secure)**
+
+  * Filters: `label`, `date_from`, `date_to`
+  * Excel-injection guard for cells starting with `= + - @`
+* **PRG polish**
+
+  * `GET /scan` → 303 to `/` (no more 405 noise)
+  * URL building fixed with `include_query_params`
+* **Tests (in main)**
+
+  * **Heuristics unit tests**
+  * **Routes/PRG integration**: POST redirect, GET /scan redirect, JSON detail, request-id header
+  * **Isolated test env**: `pytest.ini` + `tests/conftest.py` (temp SQLite, startup runs)
+
+**In PR (tests/full-suite):**
+
+* CSV export tests (headers, filters, Excel guard for subject/sender/**body\_preview**)
+* History/pages smoke (pagination text, debug endpoints)
+* Scans JSON roundtrip + 404
+* Error-path test (forced DB commit failure → 500 + request-id)
 
 ---
 
 # Roadmap to final project (updated)
 
-## Milestone M1 — MVP polish (Local) | ✔ in progress
+## M1 — MVP polish (Local) ✅ nearly done
 
-**Goal:** Solid local demo with paste-to-scan + history + detail + exports + tests.
+* [x] Detail page + history links
+* [x] CSV export + filters (+ guard)
+* [x] PRG for `/scan`
+* [x] Basic tests (heuristics + PRG)
+* [ ] Merge **full-suite** PR (CSV/history/error-path tests)
 
-* [x] **Detail page** (`/scan/{id}/view`) and History links.
-* [x] **CSV export + filters** (`/export/csv` + History form).
-* [ ] **Basic tests**
+## M2 — Gmail ingestion (near real-time)
 
-  * Unit: `classify_text()` happy/edge cases.
-  * Integration: `POST /scan` persists; `GET /history` paginates.
-  * ✅ Verify: `pytest -q` passes.
+1. Gmail API + OAuth (capture refresh token)
+2. Watch + Pub/Sub push → `POST /webhooks/gmail`
+3. Fetch messages → dedupe → scan → persist
 
-## Milestone M2 — Gmail ingestion (near real-time) | \~2–3 days
+## M3 — Real ML baseline
 
-**Goal:** New emails auto-scan and appear in History.
+TF-IDF + LR/SVM, calibrated; saved `.joblib`; show model version on `/health`; fall back to heuristics.
 
-1. **Google Cloud & OAuth**
+## M4 — Auth, roles, feedback loop
 
-   * Enable **Gmail API**, create OAuth client, store creds in DB or `.env`.
-   * Minimal one-time login flow to capture refresh token.
-   * ✅ Verify: call `users.messages.list` for your inbox.
+Session/OAuth login, gated history/admin, label corrections stored for retrain.
 
-2. **Gmail watch + Pub/Sub (push)**
+## M5 — Prod & CI/CD
 
-   * Create **Topic + Push Subscription** to `POST /webhooks/gmail`.
-   * Token check + idempotent handling.
-   * ✅ Verify: webhook gets push; logs show `historyId`.
+Docker + Postgres, deploy (Render/Fly/AWS), GitHub Actions (lint/test/build/deploy), logs/metrics/alerts.
 
-3. **Fetch + scan**
+## M6 — Safety, privacy & retention
 
-   * Resolve message IDs via Gmail History API → fetch → dedupe by Gmail `id` → persist + run scan.
-   * ✅ Verify: send test mail; see it in History with correct label.
-
-> Start with in-process `BackgroundTasks`; move to a worker later.
-
-## Milestone M3 — Real ML baseline | \~2–3 days
-
-**Goal:** TF-IDF + Logistic Regression (or Linear SVM) that beats heuristics.
-
-1. **Dataset**: Enron ham + modern ham samples; public phish + curated samples.
-   ✅ Verify: dedupe & class balance.
-
-2. **Preprocessing**: HTML strip, tokenization, URL + header features.
-   ✅ Verify: raw → features deterministically.
-
-3. **Model**: TF-IDF (word 1–2, char 3–5) + LR + calibration; save `.joblib` with version metadata.
-   ✅ Verify: hold-out metrics (macro-F1, phishing P/R) + confusion matrix.
-
-4. **Service integration**: load model on startup, fall back to heuristics; reason strings from top word/URL features.
-   ✅ Verify: `/health` shows model version; `/scan` uses model.
-
-## Milestone M4 — Auth, roles, feedback | \~1–2 days
-
-**Goal:** Secure UI + allow corrections for retraining.
-
-* Simple session auth (email/password) or Google OAuth; roles: user/admin.
-  ✅ Verify: `/history` gated; `/admin` visible for admin.
-
-* **Feedback**: on detail page, “Correct label” (Safe/Spam/Phish) + notes → store for retrain.
-  ✅ Verify: CSV export of feedback exists.
-
-## Milestone M5 — Prod & CI/CD | \~2–3 days
-
-**Goal:** One-click deploy + observability.
-
-* **Docker** (app + Postgres \[+ Redis optional]) and entrypoint runs `alembic upgrade head`.
-  ✅ Verify: `docker compose up` works locally.
-
-* **Deploy** (Render/Fly.io/Azure/AWS) with env secrets + HTTPS + domain.
-  ✅ Verify: live healthcheck; webhook reachable.
-
-* **CI** (GitHub Actions): lint, test, build, push, deploy.
-  ✅ Verify: PR checks; main auto-deploys.
-
-* **Logs & metrics**: structured JSON logs with `request_id`; basic metrics (requests, latency, errors).
-  ✅ Verify: logs visible; alerts on 500 spikes.
-
-## Milestone M6 — Safety, privacy & retention | \~1 day
-
-**Goal:** Handle real data responsibly.
-
-* Data minimization; short TTL for raw bodies; nightly purge job.
-* Secret management; security headers (CSP, HSTS, Referrer-Policy), HTTPS-only cookies, CSRF on forms, rate limiting.
-  ✅ Verify: purge job deletes old raw; headers present; CSRF passes.
+Data minimization + purge job; CSP/HSTS; CSRF; rate limiting; secrets management.
 
 ---
 
-# Risks & quick mitigations (unchanged but important)
+# Risks & quick mitigations
 
-* **Gmail watch expiry** → store `current_history_id`; renew watch before expiry; resync window on error.
-* **Webhook idempotency** → dedupe by `historyId`/`messageId`; fast 2xx then do work async.
-* **Dataset realism** → include modern ham + adversarial samples (punycode, zero-width, URL shorteners).
-* **Explainability** → generate reasons from word/URL features (not char n-grams).
-* **CSV safety** → already escaping `= + - @` (done).
+* Gmail watch drift/expiry → store and refresh `historyId`; resync window on error
+* Webhook idempotency → dedupe by Gmail `messageId`/`historyId`
+* Dataset realism → mix modern ham & adversarial phish (punycode, zero-width, shorteners)
+* Explainability → reasons from top n-grams/URLs, not only char grams
+* CSV safety → guarded (done)
 
 ---
 
 # Acceptance checklist (final “done”)
 
-* [ ] Live site with auth, HTTPS, and a domain.
-* [ ] Gmail push → webhook → fetch → scan → persist → visible in History.
-* [ ] Paste-to-scan works with **model** + human-readable reasons.
-* [ ] Detail page, filters (label/date/sender), **CSV export**.
-* [ ] Feedback loop stored and exportable.
-* [ ] Unit/integration tests passing in CI.
-* [ ] Alembic migrations auto-run on deploy.
-* [ ] Logs + basic metrics; error alerting active.
-* [ ] Data retention job running; secrets managed.
+* [ ] Live site (auth, HTTPS, domain)
+* [ ] Gmail push → webhook → fetch → scan → history
+* [ ] Paste-to-scan uses **model** + reasons
+* [ ] Detail page + filters + CSV export
+* [ ] Feedback loop exportable
+* [ ] Unit/integration tests passing in CI
+* [ ] Alembic runs on deploy
+* [ ] Logs + basic metrics + alerts
+* [ ] Retention job + secrets managed
 
 ---
 
-# What we do next (immediate)
+# What we do next (pick one)
 
-Pick one track:
+**Track A: Quick UI polish (30–60 min)**
 
-**Track A (quick polish, \~30–60 min):**
+* Colored label chips in History/Detail
+* Add sender/subject filters to History
+* A few focused tests for those behaviors
 
-* Add colored **label chips** (Safe/Spam/Phish) in History & Detail.
-* Add **sender/subject** filters to History (server-side).
-* Write **3–5 tests** (unit + one integration) to lock today’s behavior.
+**Track B: Gmail OAuth (M2.1, 2–3 hrs to first token)**
 
-**Track B (integration, \~2–3 hrs to first token): Gmail OAuth (M2.1)**
+* Google Cloud project + OAuth client
+* Minimal `/auth/google` flow to capture refresh token
+* Scaffold `/webhooks/gmail` with verification
 
-* I’ll walk you through Google Cloud setup and a tiny `/auth/google` flow to capture a refresh token, then we’ll stand up `/webhooks/gmail`.
-
-Tell me which track you want, and we’ll keep going step-by-step like before.
+Tell me your pick, and I’ll guide step-by-step like before.
