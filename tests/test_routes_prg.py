@@ -9,8 +9,8 @@ def test_health_ok(client):
 
 
 def test_get_scan_redirects_to_home(client):
-    r = client.get("/scan", allow_redirects=False)
-    assert r.status_code in (303, 307)  # we use 303
+    r = client.get("/scan", follow_redirects=False)
+    assert r.status_code in (303, 307)
     assert r.headers["location"].endswith("/")
 
 
@@ -20,16 +20,14 @@ def test_prg_post_scan_redirects_to_detail(client):
         "subject": "Test PRG",
         "sender": "test@example.com",
     }
-    r = client.post("/scan", data=form, allow_redirects=False)
+    r = client.post("/scan", data=form, follow_redirects=False)  # ← changed
     assert r.status_code == 303
     loc = r.headers.get("location", "")
-    assert "/scan/" in loc and "/view" in loc
-    assert "ok=1" in loc
+    assert "/scan/" in loc and "/view" in loc and "ok=1" in loc
     assert r.headers.get("X-Request-ID")
 
 
 def test_follow_redirect_and_detail_html(client):
-    # Post and then follow to the detail view
     r = client.post(
         "/scan",
         data={
@@ -37,12 +35,11 @@ def test_follow_redirect_and_detail_html(client):
             "subject": "Subj",
             "sender": "s@example.com",
         },
-        allow_redirects=False,
+        follow_redirects=False,  # ← changed
     )
     loc = r.headers["location"]
     r2 = client.get(loc)
     assert r2.status_code == 200
-    # HTML contains our header text
     assert "Scan Detail" in r2.text
 
 
@@ -51,7 +48,7 @@ def test_json_detail_matches_redirect_id(client):
     r = client.post(
         "/scan",
         data={"raw": "click here", "subject": "S", "sender": "a@b"},
-        allow_redirects=False,
+        follow_redirects=False,
     )
     loc = r.headers["location"]  # e.g., /scan/3/view?ok=1
     m = re.search(r"/scan/(\d+)/view", loc)
