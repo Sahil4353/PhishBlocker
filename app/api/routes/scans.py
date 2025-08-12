@@ -39,7 +39,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 # -----------------------------------------------------------------------------
-# GET /scan/{scan_id} — lightweight JSON detail (template can come later)
+# GET /scan/{scan_id} — lightweight JSON detail
 # -----------------------------------------------------------------------------
 @router.get("/scan/{scan_id}")
 def scan_detail(scan_id: int, db: Session = Depends(get_db)):
@@ -97,6 +97,8 @@ def export_csv(
     Filters:
       - label: safe|spam|phishing
       - date_from/date_to: YYYY-MM-DD (inclusive)
+    CSV header:
+      id, created_at, subject, sender, label, confidence, reasons, body_preview
     """
     try:
         q = db.query(Scan)
@@ -112,27 +114,36 @@ def export_csv(
         if end_dt and hasattr(Scan, "created_at"):
             q = q.filter(Scan.created_at <= end_dt)
 
-        # Build CSV in-memory (small/medium datasets). Switch to streaming writer if you expect very large exports.
+        rows = q.order_by(Scan.id.desc()).all()
+
+        # Build CSV in-memory (fine for small/medium datasets).
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(
-            ["id", "created_at", "subject", "sender", "label", "confidence", "reasons"]
+            [
+                "id",
+                "created_at",
+                "subject",
+                "sender",
+                "label",
+                "confidence",
+                "reasons",
+                "body_preview",  # <-- added
+            ]
         )
 
-        rows = q.order_by(Scan.id.desc()).all()
         for s in rows:
-            safe_subject = _excel_safe(s.subject or "")
-            safe_sender = _excel_safe(s.sender or "")
             created = s.created_at.isoformat() if getattr(s, "created_at", None) else ""
             writer.writerow(
                 [
                     s.id,
                     created,
-                    safe_subject,
-                    safe_sender,
-                    s.label,
-                    s.confidence,
+                    _excel_safe(s.subject or ""),
+                    _excel_safe(s.sender or ""),
+                    s.label or "",
+                    s.confidence if s.confidence is not None else "",
                     s.reasons or "",
+                    _excel_safe(s.body_preview or ""),  # <-- guarded
                 ]
             )
 
@@ -149,7 +160,7 @@ def export_csv(
         return StreamingResponse(
             iter([buf.read()]),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=scans.csv"},
+            headers={"Content-Disposition": 'attachment; filename="scans.csv"'},
         )
 
     except ValueError as ve:
