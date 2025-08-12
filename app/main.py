@@ -11,6 +11,7 @@ from app.api.routes.debug import router as debug_router
 from app.api.routes.pages import router as pages_router
 from app.api.routes.scans import router as scans_router
 from app.core.logging import get_logger
+from app.core.middleware import RequestIdMiddleware
 from app.db import engine
 from app.models.base import Base  # ensures metadata is available
 
@@ -35,6 +36,8 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="PhishBlocker", version="0.1.0", lifespan=lifespan)
+
+    app.add_middleware(RequestIdMiddleware)
 
     # Mount routers
     app.include_router(pages_router)

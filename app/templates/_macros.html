@@ -1,0 +1,25 @@
+{# app/templates/_macros.html #}
+{% macro label_chip(label) -%}
+{% set l = (label or '')|lower %}
+{% if l == 'phishing' %}
+<span
+    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #fecaca;background:#fde8e8;color:#b91c1c;white-space:nowrap;">
+    Phishing
+</span>
+{% elif l == 'spam' %}
+<span
+    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #fef08a;background:#fef9c3;color:#854d0e;white-space:nowrap;">
+    Spam
+</span>
+{% elif l == 'safe' %}
+<span
+    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #bbf7d0;background:#ecfdf5;color:#065f46;white-space:nowrap;">
+    Safe
+</span>
+{% else %}
+<span
+    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #e5e7eb;background:#f9fafb;color:#374151;white-space:nowrap;">
+    {{ label or 'Unknown' }}
+</span>
+{% endif %}
+{%- endmacro %}

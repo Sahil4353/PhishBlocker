@@ -5,7 +5,7 @@ from math import ceil
 from typing import Generator, Optional
 
 from fastapi import APIRouter, Depends, Form, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, load_only
 
@@ -58,6 +58,13 @@ def index(request: Request):
         )
 
 
+# Optional nicety: any GET /scan becomes a redirect to "/"
+@router.get("/scan", include_in_schema=False, name="scan_get_redirect")
+def scan_get_redirect(request: Request):
+    return RedirectResponse(url=request.url_for("index"), status_code=303)
+
+
+# PRG: on success we redirect to /scan/{id}/view instead of rendering directly
 @router.post("/scan", response_class=HTMLResponse, name="scan_email")
 def scan_email(
     request: Request,
@@ -66,7 +73,7 @@ def scan_email(
     sender: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    """Accept pasted/raw email content, classify, and persist."""
+    """Accept pasted/raw email content, classify, persist, then redirect (PRG)."""
     try:
         raw_text = (raw or "").strip()
 
@@ -95,6 +102,7 @@ def scan_email(
             except Exception:
                 pass
             logger.exception("DB commit failed while saving Scan record: %s", db_err)
+            # On error we still render a page so the user sees the message.
             return templates.TemplateResponse(
                 "result.html",
                 {
@@ -106,17 +114,11 @@ def scan_email(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Success → include scan_id so template can link to detail
-        return templates.TemplateResponse(
-            "result.html",
-            {
-                "request": request,
-                "label": label,
-                "confidence": confidence,
-                "reasons": reasons,
-                "scan_id": record.id,
-            },
-        )
+        # PRG: 303 See Other -> always follow with GET to the detail page
+        detail_url = request.url_for(
+            "scan_detail_view", scan_id=record.id
+        ).include_query_params(ok="1")
+        return RedirectResponse(url=str(detail_url), status_code=303)
 
     except Exception as e:
         logger.exception("scan_email failed: %s", e)
@@ -223,7 +225,11 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
         logger.info("rendering scan detail view", extra={"scan_id": scan_id})
         return templates.TemplateResponse(
             "scan_detail.html",
-            {"request": request, "scan": payload},
+            {
+                "request": request,
+                "scan": payload,
+                "ok": request.query_params.get("ok") == "1",  # for optional banner
+            },
         )
 
     except Exception as e:

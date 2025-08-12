@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 {% block title %}History · PhishBlocker{% endblock %}
 
 {% block content %}
@@ -84,7 +85,7 @@
                     {{ scan.sender or "(unknown)" }}
                 </td>
                 <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
-                    {{ scan.label|capitalize }}
+                    {{ macros.label_chip(scan.label) }}
                 </td>
                 <td style="padding:8px;border-bottom:1px solid #f0f0f0;">
                     {{ '%.0f'|format((scan.confidence or 0) * 100) }}%
