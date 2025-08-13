@@ -37,3 +37,6 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+/data/raw/
+/data/processed/*.csv
+/models/*.joblib
