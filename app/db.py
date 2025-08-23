@@ -28,7 +28,6 @@ def _configure_sqlalchemy_logging() -> None:
       - SQL_ECHO=1  -> show SQL statements (approx INFO)
       - SQL_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR (overrides)
     """
-    # default level
     level_name = os.getenv("SQL_LOG_LEVEL")
     if not level_name:
         level_name = "INFO" if os.getenv("SQL_ECHO", "0") == "1" else "WARNING"
@@ -55,6 +54,7 @@ def _redact_dsn(dsn: str) -> str:
     """
     Hide credentials in logs: postgres://user:pass@host -> postgres://***:***@host
     """
+    # matches scheme://user:pass@host...
     return re.sub(r"(://)([^:/@]+)(:([^@]*))?@", r"\1***:***@", dsn)
 
 
@@ -92,16 +92,26 @@ if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        """
+        Apply pragmatic defaults for better concurrency and safety.
+        - foreign_keys=ON ensures FKs are enforced
+        - journal_mode=WAL improves concurrent readers
+        - synchronous=NORMAL balances durability vs. speed
+        - busy_timeout=30000 helps under write contention
+        """
+        cur = None
         try:
             cur = dbapi_connection.cursor()
             cur.execute("PRAGMA foreign_keys=ON")
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA busy_timeout=30000")
             cur.close()
         except Exception as e:
             # Don't crash the app if PRAGMAs fail; just log it.
             try:
-                cur.close()
+                if cur is not None:
+                    cur.close()
             except Exception:
                 pass
             logger.exception("Failed to apply SQLite PRAGMAs: %s", e)
@@ -141,15 +151,40 @@ def _on_handle_error(exception_context):
 
 
 # -----------------------------------------------------------------------------
-# Session factory + optional context manager
+# Session factory + shared FastAPI dependency and context manager
 # -----------------------------------------------------------------------------
-SessionLocal = sessionmaker(
+SessionLocal: sessionmaker[Session] = sessionmaker(
     bind=engine,
     autoflush=False,
     autocommit=False,
     expire_on_commit=False,  # keep ORM objects usable after commit()
     future=True,
 )
+
+
+def get_db() -> Generator[Session, None, None]:
+    """
+    Shared FastAPI dependency. Prefer importing this in routes:
+
+        from app.db import get_db
+
+    so each endpoint doesn't need its own copy.
+    """
+    db: Session = SessionLocal()
+    try:
+        yield db
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("DB dependency error: %s", e)
+        raise
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -161,7 +196,7 @@ def get_session() -> Generator[Session, None, None]:
         with get_session() as db:
             db.add(obj)
 
-    Routes should keep using FastAPI's dependency pattern.
+    Routes should keep using get_db() (the FastAPI dependency).
     """
     db: Session = SessionLocal()
     try:

@@ -42,34 +42,83 @@ class _RequestIdInjector(Filter):
         if not hasattr(record, "request_id"):
             setattr(record, "request_id", rid)
         else:
-            # If something else set it, keep theirs
             if getattr(record, "request_id", None) in (None, ""):
                 setattr(record, "request_id", rid)
         return True
+
+
+def _ensure_root_handler() -> logging.Handler:
+    """
+    Ensure the root logger has at least one handler configured with our formatter.
+    Returns that handler (first handler on root).
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    # If the first handler has no formatter, set one.
+    if not root.handlers[0].formatter:
+        root.handlers[0].setFormatter(logging.Formatter(LOG_FORMAT))
+    return root.handlers[0]
 
 
 def setup_logging(level: Optional[str] = None) -> None:
     """
     Initialize root logging once, idempotently.
     """
-    root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    h = _ensure_root_handler()
 
     eff_level = (level or settings.LOG_LEVEL).upper()
-    root.setLevel(getattr(logging, eff_level, logging.INFO))
+    logging.getLogger().setLevel(getattr(logging, eff_level, logging.INFO))
 
+    # Attach our filters to all root handlers (once)
     disable_flt = _DisableWhenOff()
     rid_flt = _RequestIdInjector()
 
-    for h in root.handlers:
-        # Attach filters once
-        if not any(isinstance(f, _DisableWhenOff) for f in h.filters):
-            h.addFilter(disable_flt)
-        if not any(isinstance(f, _RequestIdInjector) for f in h.filters):
-            h.addFilter(rid_flt)
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if not any(isinstance(f, _DisableWhenOff) for f in handler.filters):
+            handler.addFilter(disable_flt)
+        if not any(isinstance(f, _RequestIdInjector) for f in handler.filters):
+            handler.addFilter(rid_flt)
 
 
 def get_logger(name: str) -> logging.Logger:
     setup_logging()
     return logging.getLogger(name)
+
+
+def attach_filters_to(logger: logging.Logger) -> None:
+    """
+    Attach the same filters the root logger uses to a specific logger (e.g., uvicorn.*).
+    If the target logger has no handlers, add a StreamHandler with the root formatter.
+    Idempotent: won’t duplicate filters.
+    """
+    setup_logging()
+
+    root = logging.getLogger()
+    root_handler = _ensure_root_handler()
+
+    # Try to reuse existing filter instances from the root handler to avoid duplication.
+    existing_disable = (
+        next((f for f in root_handler.filters if isinstance(f, _DisableWhenOff)), None)
+        or _DisableWhenOff()
+    )
+    existing_rid = (
+        next(
+            (f for f in root_handler.filters if isinstance(f, _RequestIdInjector)), None
+        )
+        or _RequestIdInjector()
+    )
+
+    # If the target logger has no handlers, attach one with the same formatter.
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(root_handler.formatter or logging.Formatter(LOG_FORMAT))
+        logger.addHandler(h)
+
+    # Attach filters to each handler (once)
+    for h in logger.handlers:
+        if not any(isinstance(f, _DisableWhenOff) for f in h.filters):
+            h.addFilter(existing_disable)
+        if not any(isinstance(f, _RequestIdInjector) for f in h.filters):
+            h.addFilter(existing_rid)
