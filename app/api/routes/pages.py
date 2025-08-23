@@ -1,4 +1,3 @@
-# app/api/routes/pages.py
 from __future__ import annotations
 
 from math import ceil
@@ -18,7 +17,7 @@ logger = get_logger(__name__)
 templates = Jinja2Templates(directory="app/templates")
 MAX_BODY_PREVIEW_LEN = 500
 
-router = APIRouter()
+router = APIRouter(tags=["pages"])  # purely for Swagger grouping
 
 
 # -----------------------------------------------------------------------------
@@ -78,9 +77,7 @@ def scan_email(
         raw_text = (raw or "").strip()
 
         label, confidence, reasons = classify_text(raw_text)
-        logger.info(
-            "classified email", extra={"label": label, "confidence": confidence}
-        )
+        logger.info("classified email label=%s conf=%.3f", label, confidence)
 
         record = Scan(
             subject=subject,
@@ -222,7 +219,7 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
             "body_preview": scan.body_preview,
         }
 
-        logger.info("rendering scan detail view", extra={"scan_id": scan_id})
+        logger.info("rendering scan detail view scan_id=%s", scan_id)
         return templates.TemplateResponse(
             "scan_detail.html",
             {

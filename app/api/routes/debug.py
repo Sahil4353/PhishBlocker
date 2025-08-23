@@ -12,7 +12,7 @@ from app.db import SessionLocal
 from app.models.scan import Scan
 
 logger = get_logger(__name__)
-router = APIRouter()
+router = APIRouter(tags=["debug"])  # group endpoints in Swagger
 
 
 def get_db() -> Generator[Session, None, None]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
-from typing import Generator, Optional
+from typing import Generator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -14,7 +14,7 @@ from app.db import SessionLocal
 from app.models.scan import Scan
 
 logger = get_logger(__name__)
-router = APIRouter()
+router = APIRouter(tags=["api"])  # groups these under "api" in Swagger
 
 
 # -----------------------------------------------------------------------------
@@ -39,7 +39,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 # -----------------------------------------------------------------------------
-# GET /scan/{scan_id} — lightweight JSON detail (template can come later)
+# GET /scan/{scan_id} — lightweight JSON detail (template is in pages.py)
 # -----------------------------------------------------------------------------
 @router.get("/scan/{scan_id}")
 def scan_detail(scan_id: int, db: Session = Depends(get_db)):
@@ -64,9 +64,7 @@ def scan_detail(scan_id: int, db: Session = Depends(get_db)):
             "reasons": (scan.reasons or "").split(", ") if scan.reasons else [],
             "body_preview": scan.body_preview,
         }
-        logger.info(
-            "served scan detail", extra={"scan_id": scan_id, "label": scan.label}
-        )
+        logger.info("served scan detail scan_id=%s label=%s", scan_id, scan.label)
         return JSONResponse(payload)
 
     except HTTPException:
@@ -88,12 +86,12 @@ def scan_detail(scan_id: int, db: Session = Depends(get_db)):
 @router.get("/export/csv")
 def export_csv(
     db: Session = Depends(get_db),
-    label: Optional[str] = Query(default=None, pattern="^(safe|spam|phishing)$"),
+    label: Optional[Literal["safe", "spam", "phishing"]] = Query(default=None),
     date_from: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
 ):
     """
-    Stream a CSV of scans. Excel-injection guarded.
+    Stream a CSV of scans.
     Filters:
       - label: safe|spam|phishing
       - date_from/date_to: YYYY-MM-DD (inclusive)
@@ -112,7 +110,7 @@ def export_csv(
         if end_dt and hasattr(Scan, "created_at"):
             q = q.filter(Scan.created_at <= end_dt)
 
-        # Build CSV in-memory (small/medium datasets). Switch to streaming writer if you expect very large exports.
+        # Build CSV in-memory (ok for small/medium exports).
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(
@@ -136,19 +134,18 @@ def export_csv(
                 ]
             )
 
-        buf.seek(0)
+        # Reset buffer and stream the whole content (simple approach)
+        csv_bytes = buf.getvalue()
         logger.info(
-            "csv export complete",
-            extra={
-                "count": len(rows),
-                "label": label,
-                "date_from": date_from,
-                "date_to": date_to,
-            },
+            "csv export complete count=%s label=%s date_from=%s date_to=%s",
+            len(rows),
+            label,
+            date_from,
+            date_to,
         )
         return StreamingResponse(
-            iter([buf.read()]),
-            media_type="text/csv",
+            iter([csv_bytes]),
+            media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": "attachment; filename=scans.csv"},
         )
 
