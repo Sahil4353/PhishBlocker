@@ -1,155 +1,146 @@
-boom—here’s your fresh snapshot, matching the style you liked.
+# PhishBlocker — Status Snapshot (current code)
 
-# What we’ve accomplished (current state)
+## What’s done ✅
 
-* **FastAPI app** with clean app factory + lifespan; routers split by concern:
+* **FastAPI app** with clean app factory + lifespan and request-ID middleware.
 
-  * `pages` (HTML: `/`, `POST /scan`, `/history`, `/scan/{id}/view`)
-  * `scans` (JSON: `/scan/{id}`, downloads: `/export/csv`)
-  * `debug` (`/health`, `/_debug/scan_count`, `/_debug/cwd`)
-* **Templates/UI**
+  * Routers:
 
-  * New **Scan Detail (HTML)** page with label, confidence, reasons, body preview.
-  * **History** table with pagination, row → detail links, and **CSV Export form** (label + date filters).
-  * **Result** page now shows **View detail / JSON / History / Scan another** links.
-* **Heuristic classifier** moved to `app/services/heuristics.py` (precompiled regexes, safe guards, logs).
-* **Centralized logging + config** in `app/core`:
+    * **pages** (HTML): `/`, `POST /scan`, `/history`, `/scan/{id}/view`
+    * **scans** (JSON/exports): `GET /scan/{id}`, `GET /export/csv`
+    * **debug**: `/health`, `/_debug/scan_count`, `/_debug/cwd`
+* **Logging & config**
 
-  * `ENABLE_LOGGING` (true/false), `LOG_LEVEL`, `ENV` via env vars.
-  * Consistent format, safe filters; one-liner `get_logger(__name__)`.
-* **ORM model (Scan)** already in place; History query avoids loading large `raw`.
-* **DB layer**: dependency with defensive rollback+close; dev startup creates tables.
-* **CSV export** with Excel injection guard and optional filters (`label`, `date_from`, `date_to`).
-* **Error handling**: try/except around every route; graceful fallbacks for pages.
-* **DX**: routes named explicitly (`name="…"`) so `url_for()` is stable; hot pagination fix (querystring).
+  * Centralized env-driven logging (`ENABLE_LOGGING`, `LOG_LEVEL`, `ENV`).
+  * Request ID injected into every log line; filters attached to `uvicorn.*`.
+* **Database & migrations**
 
----
+  * Models: **Email** (normalized message) + **Scan** (classification), FK `scans.email_id → emails.id (ON DELETE CASCADE)`.
+  * Indexes on sender/timestamps/labels; check constraint on confidence.
+  * Alembic wired to import `app.models` so autogenerate sees both tables.
+  * SQLite tuned (FKs ON, WAL, synchronous=NORMAL, busy\_timeout=30s).
+* **Data ingestion (batch)**
 
-# Roadmap to final project (updated)
+  * `scripts/ingest_enron.py` parses raw Enron CSV → **data/processed/enron\_parsed.csv** (verified).
+* **Services (new)**
 
-## Milestone M1 — MVP polish (Local) | ✔ in progress
+  * `services/parser.py`: RFC-822 `.eml` → provider-agnostic dict (headers, bodies, URLs, auth results, received IPs).
+  * `services/heuristics.py`: keeps `classify_text(text)` + adds `analyze(parsed)` flags.
+  * `services/scan_pipeline.py`: one-stop **parse → analyze → persist Email+Scan** (optional ML model hook).
+* **Pages/UI**
 
-**Goal:** Solid local demo with paste-to-scan + history + detail + exports + tests.
+  * History page with pagination; detail page for a scan; CSV export (label/date filters).
+  * CSV export guarded against Excel formula injection.
+* **DB access**
 
-* [x] **Detail page** (`/scan/{id}/view`) and History links.
-* [x] **CSV export + filters** (`/export/csv` + History form).
-* [ ] **Basic tests**
+  * Shared `get_db()` dependency in `app/db.py`; routes can import directly.
 
-  * Unit: `classify_text()` happy/edge cases.
-  * Integration: `POST /scan` persists; `GET /history` paginates.
-  * ✅ Verify: `pytest -q` passes.
+## Branches & commits
 
-## Milestone M2 — Gmail ingestion (near real-time) | \~2–3 days
-
-**Goal:** New emails auto-scan and appear in History.
-
-1. **Google Cloud & OAuth**
-
-   * Enable **Gmail API**, create OAuth client, store creds in DB or `.env`.
-   * Minimal one-time login flow to capture refresh token.
-   * ✅ Verify: call `users.messages.list` for your inbox.
-
-2. **Gmail watch + Pub/Sub (push)**
-
-   * Create **Topic + Push Subscription** to `POST /webhooks/gmail`.
-   * Token check + idempotent handling.
-   * ✅ Verify: webhook gets push; logs show `historyId`.
-
-3. **Fetch + scan**
-
-   * Resolve message IDs via Gmail History API → fetch → dedupe by Gmail `id` → persist + run scan.
-   * ✅ Verify: send test mail; see it in History with correct label.
-
-> Start with in-process `BackgroundTasks`; move to a worker later.
-
-## Milestone M3 — Real ML baseline | \~2–3 days
-
-**Goal:** TF-IDF + Logistic Regression (or Linear SVM) that beats heuristics.
-
-1. **Dataset**: Enron ham + modern ham samples; public phish + curated samples.
-   ✅ Verify: dedupe & class balance.
-
-2. **Preprocessing**: HTML strip, tokenization, URL + header features.
-   ✅ Verify: raw → features deterministically.
-
-3. **Model**: TF-IDF (word 1–2, char 3–5) + LR + calibration; save `.joblib` with version metadata.
-   ✅ Verify: hold-out metrics (macro-F1, phishing P/R) + confusion matrix.
-
-4. **Service integration**: load model on startup, fall back to heuristics; reason strings from top word/URL features.
-   ✅ Verify: `/health` shows model version; `/scan` uses model.
-
-## Milestone M4 — Auth, roles, feedback | \~1–2 days
-
-**Goal:** Secure UI + allow corrections for retraining.
-
-* Simple session auth (email/password) or Google OAuth; roles: user/admin.
-  ✅ Verify: `/history` gated; `/admin` visible for admin.
-
-* **Feedback**: on detail page, “Correct label” (Safe/Spam/Phish) + notes → store for retrain.
-  ✅ Verify: CSV export of feedback exists.
-
-## Milestone M5 — Prod & CI/CD | \~2–3 days
-
-**Goal:** One-click deploy + observability.
-
-* **Docker** (app + Postgres \[+ Redis optional]) and entrypoint runs `alembic upgrade head`.
-  ✅ Verify: `docker compose up` works locally.
-
-* **Deploy** (Render/Fly.io/Azure/AWS) with env secrets + HTTPS + domain.
-  ✅ Verify: live healthcheck; webhook reachable.
-
-* **CI** (GitHub Actions): lint, test, build, push, deploy.
-  ✅ Verify: PR checks; main auto-deploys.
-
-* **Logs & metrics**: structured JSON logs with `request_id`; basic metrics (requests, latency, errors).
-  ✅ Verify: logs visible; alerts on 500 spikes.
-
-## Milestone M6 — Safety, privacy & retention | \~1 day
-
-**Goal:** Handle real data responsibly.
-
-* Data minimization; short TTL for raw bodies; nightly purge job.
-* Secret management; security headers (CSP, HSTS, Referrer-Policy), HTTPS-only cookies, CSRF on forms, rate limiting.
-  ✅ Verify: purge job deletes old raw; headers present; CSRF passes.
+* `feat/data-enron-ingest` — ingestion + schema + logging + routes (foundation).
+* `feat/services-pipeline` — **added** `parser.py` & `scan_pipeline.py` (tracking `origin/feat/services-pipeline`), no new migrations.
 
 ---
 
-# Risks & quick mitigations (unchanged but important)
+## What changed since the last snapshot 🔄
 
-* **Gmail watch expiry** → store `current_history_id`; renew watch before expiry; resync window on error.
-* **Webhook idempotency** → dedupe by `historyId`/`messageId`; fast 2xx then do work async.
-* **Dataset realism** → include modern ham + adversarial samples (punycode, zero-width, URL shorteners).
-* **Explainability** → generate reasons from word/URL features (not char n-grams).
-* **CSV safety** → already escaping `= + - @` (done).
-
----
-
-# Acceptance checklist (final “done”)
-
-* [ ] Live site with auth, HTTPS, and a domain.
-* [ ] Gmail push → webhook → fetch → scan → persist → visible in History.
-* [ ] Paste-to-scan works with **model** + human-readable reasons.
-* [ ] Detail page, filters (label/date/sender), **CSV export**.
-* [ ] Feedback loop stored and exportable.
-* [ ] Unit/integration tests passing in CI.
-* [ ] Alembic migrations auto-run on deploy.
-* [ ] Logs + basic metrics; error alerting active.
-* [ ] Data retention job running; secrets managed.
+* **Added** `services/parser.py` and `services/scan_pipeline.py`.
+* **Kept** existing HTML flow (`POST /scan` in `pages.py`) using `classify_text` — pipeline is ready but not yet wired into routes.
+* **Improved** scans API CSV export and docs grouping (tags).
+* **Shared** `get_db()` moved to `app/db.py` (routes can be DRY’d to use it).
 
 ---
 
-# What we do next (immediate)
+## Smoke checklist (now)
 
-Pick one track:
+* Run app:
 
-**Track A (quick polish, \~30–60 min):**
+  ```
+  uvicorn app.main:app --reload
+  ```
+* Hit:
 
-* Add colored **label chips** (Safe/Spam/Phish) in History & Detail.
-* Add **sender/subject** filters to History (server-side).
-* Write **3–5 tests** (unit + one integration) to lock today’s behavior.
+  * `/` (form), `/history`, `/scan/{id}/view`
+  * `/docs` & `/openapi.json`
+  * `/export/csv?label=safe&date_from=2025-01-01`
+  * `/health`, `/_debug/scan_count`
+* Quick pipeline demo (optional REPL):
 
-**Track B (integration, \~2–3 hrs to first token): Gmail OAuth (M2.1)**
+  ```py
+  from sqlalchemy.orm import Session
+  from sqlalchemy import create_engine
+  from app.services.scan_pipeline import create_scan_from_text
+  from app.models import Scan
 
-* I’ll walk you through Google Cloud setup and a tiny `/auth/google` flow to capture a refresh token, then we’ll stand up `/webhooks/gmail`.
+  e = create_engine("sqlite:///phishblocker.db", future=True)
+  from sqlalchemy.orm import Session
+  with Session(e) as s:
+      sc = create_scan_from_text(s, "Please verify your account at http://1.2.3.4/login", subject="Action required", sender="it@corp.com")
+      print(sc.id, sc.label, sc.confidence, sc.email_id)
+  ```
 
-Tell me which track you want, and we’ll keep going step-by-step like before.
+---
+
+## Roadmap (updated)
+
+### M1 — MVP polish (Local) · in progress
+
+* [ ] Switch `pages.py` **POST /scan** to use `create_scan_from_text` (persists Email + Scan consistently).
+* [ ] Add **/api/scan (POST)** and **/api/scans (GET)** endpoints (JSON clients).
+* [ ] Basic tests:
+
+  * Unit: `classify_text()` & `analyze(parsed)`
+  * Integration: `POST /scan` persists ↔ `GET /scan/{id}` returns; CSV export filters.
+
+### M2 — Gmail ingestion
+
+* OAuth + token capture → fetch `.eml` → feed **create\_scan\_from\_eml\_bytes** → show in History.
+* Optional: webhook (`/webhooks/gmail`) later; start with pull.
+
+### M3 — ML baseline
+
+* TF-IDF + Logistic Regression (+ calibration); joblib with version string.
+* Integrate via `model.predict_with_explanations(text, meta)` in pipeline.
+
+### M4 — Feedback & filters
+
+* Detail page: “Correct label” (Safe/Spam/Phish) + notes → table `feedback` for retraining.
+* History filters: label/date/sender text search.
+
+### M5 — Packaging & CI
+
+* Docker + Alembic on startup; GitHub Actions (lint/test/build).
+* Structured logs; basic metrics.
+
+### M6 — Safety & retention
+
+* TTL for raw bodies; purge job; security headers; rate limiting.
+
+---
+
+## Risks & guardrails
+
+* **Dataset drift**: include modern ham + adversarial phish (punycode/IP/shorteners).
+* **Webhook idempotency (future)**: dedupe by Gmail `messageId`/`historyId`.
+* **Explainability**: reasons from top features + heuristics flags.
+* **SQLite locking**: mitigated with WAL + busy\_timeout; can move to Postgres when deploying.
+
+---
+
+## Immediate next steps (pick one)
+
+**A) Wire the pipeline (quick win)**
+
+* Change `pages.py` `POST /scan` to call `create_scan_from_text(...)`.
+* Add `POST /api/scan` (accepts `body_text` or raw `.eml` upload) using pipeline.
+* Return `{scan_id, email_id, label, confidence, reasons, header_flags}`.
+
+**B) Tests & CI**
+
+* Add 3–5 unit tests + 1 integration, wire `pytest` in GH Actions.
+
+**C) Model baseline**
+
+* Start a simple TF-IDF LR; store `model_version`, return top reasons.
+
+Tell me which track you want next and I’ll drop in the exact code changes (no churn, minimal diff).
