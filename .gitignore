@@ -40,3 +40,6 @@ Thumbs.db
 /data/raw/
 /data/processed/*.csv
 /models/*.joblib
+models/*.png
+models/*.json
+phishblocker.db*
