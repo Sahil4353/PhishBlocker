@@ -1,146 +1,200 @@
-# PhishBlocker — Status Snapshot (current code)
+awesome—here’s your **updated status snapshot** with the ML work you just landed, plus a clear view of branches and some practical git hygiene for next steps.
+
+# PhishBlocker — Status Snapshot (updated)
 
 ## What’s done ✅
 
-* **FastAPI app** with clean app factory + lifespan and request-ID middleware.
+### App / APIs / Infra (unchanged from last snapshot)
 
-  * Routers:
+* **FastAPI app** with app-factory + lifespan and request-ID middleware.
+* **Routers**
 
-    * **pages** (HTML): `/`, `POST /scan`, `/history`, `/scan/{id}/view`
-    * **scans** (JSON/exports): `GET /scan/{id}`, `GET /export/csv`
-    * **debug**: `/health`, `/_debug/scan_count`, `/_debug/cwd`
-* **Logging & config**
+  * **pages (HTML):** `/`, `POST /scan`, `/history`, `/scan/{id}/view`
+  * **scans (JSON/exports):** `GET /scan/{id}`, `GET /export/csv`
+  * **debug:** `/health`, `/_debug/scan_count`, `/_debug/cwd`
+* **Logging & config:** env-driven logging; request-ID on all log lines; `uvicorn.*` filters.
+* **Database & migrations:** `Email` + `Scan` with FK and indexes; SQLite tuned (FK ON, WAL, etc.); Alembic wired.
+* **Batch ingestion:** `scripts/ingest_enron.py` → `data/processed/enron_parsed.csv`.
+* **Services (present, unchanged):** `parser.py`, `heuristics.py`, `scan_pipeline.py`.
+* **Pages/UI:** history, detail, CSV export (safe vs Excel formulas).
+* **DB access:** shared `get_db()` in `app/db.py`.
 
-  * Centralized env-driven logging (`ENABLE_LOGGING`, `LOG_LEVEL`, `ENV`).
-  * Request ID injected into every log line; filters attached to `uvicorn.*`.
-* **Database & migrations**
+### New: ML baseline & data prep
 
-  * Models: **Email** (normalized message) + **Scan** (classification), FK `scans.email_id → emails.id (ON DELETE CASCADE)`.
-  * Indexes on sender/timestamps/labels; check constraint on confidence.
-  * Alembic wired to import `app.models` so autogenerate sees both tables.
-  * SQLite tuned (FKs ON, WAL, synchronous=NORMAL, busy\_timeout=30s).
-* **Data ingestion (batch)**
+* **Training script**: `scripts/train_baseline.py`
 
-  * `scripts/ingest_enron.py` parses raw Enron CSV → **data/processed/enron\_parsed.csv** (verified).
-* **Services (new)**
+  * TF-IDF **word(1–2)** + **char(3–5)**, `min_df=3`, English stop-words, `float32`, feature caps.
+  * **Logistic Regression (default):** SAGA, elastic-net (`l1_ratio=0.05`), `C=0.5`, `max_iter=5000`, `class_weight="balanced"`, seeded.
+  * **Optional `--ensemble`** (not used in app yet): LR + MultinomialNB + calibrated LinearSVM (Platt/sigmoid, `cv=3`) with soft-voting.
+  * Safe probability handling, confusion matrix & per-class PR plots, rich `*.metrics.json`.
+* **Smoke predictor**: `scripts/predict.py` (prints label, per-class probs, and LR token “reasons”).
+* **Public datasets (processed in-repo)**
 
-  * `services/parser.py`: RFC-822 `.eml` → provider-agnostic dict (headers, bodies, URLs, auth results, received IPs).
-  * `services/heuristics.py`: keeps `classify_text(text)` + adds `analyze(parsed)` flags.
-  * `services/scan_pipeline.py`: one-stop **parse → analyze → persist Email+Scan** (optional ML model hook).
-* **Pages/UI**
+  * `scripts/prepare_spamassassin.py` → `data/processed/spamassassin_parsed.csv` (**4,669** rows).
+  * `scripts/prepare_nazario.py` → `data/processed/nazario_phishing.csv` (**1,565** rows).
+  * (You also trained once on a **mix**; see results below.)
+* **Artifacts (latest LR run)**
 
-  * History page with pagination; detail page for a scan; CSV export (label/date filters).
-  * CSV export guarded against Excel formula injection.
-* **DB access**
+  * Trained on: `enron_parsed.csv` + SpamAssassin + Nazario (or the smaller *mix* run).
+  * Example artifacts:
 
-  * Shared `get_db()` dependency in `app/db.py`; routes can import directly.
+    * `models/tfidf_lr_fast.joblib`
+    * `models/tfidf_lr_fast.metrics.json`
+    * `models/tfidf_lr_fast.cm.png`, `models/tfidf_lr_fast.pr.phishing.png`
+* **Results (on the \~156k “mix” run)**
+
+  * Classes: `['phishing', 'safe', 'spam']`
+  * Macro-F1 ≈ **0.723**
+
+    * phishing: P=0.487, **R=0.994**, F1=0.653
+    * safe: **P=1.000**, R=0.968, F1=0.984
+    * spam: P=0.363, **R=0.995**, F1=0.532
+  * Takeaway: current LR is **recall-oriented** on minority classes (great for catching bad mail), but **precision is low** for phishing/spam on this split. That’s expected with heavy class imbalance; we’ll tune thresholds and data balance next.
+
+> ⚠️ **Services**: unchanged on purpose. Keep using the LR artifact with the CLI for now. Don’t plug an ensemble artifact into the current service until we add the tiny “use LR’s coefficients for reasons even when ensemble predicts” shim.
+
+---
 
 ## Branches & commits
 
-* `feat/data-enron-ingest` — ingestion + schema + logging + routes (foundation).
-* `feat/services-pipeline` — **added** `parser.py` & `scan_pipeline.py` (tracking `origin/feat/services-pipeline`), no new migrations.
+### Current branch structure
+
+* **develop** — upstream base (not the branch you’re working from).
+* **feat/services-pipeline** — app services (parser/heuristics/pipeline).
+* **feat/ml/baseline-v2** — *your active ML branch* (branched from `feat/services-pipeline`, tracking `origin/feat/ml/baseline-v2`).
+* **feat/data-enron-ingest** — ingestion + schema foundations.
+
+### Suggested day-to-day flows
+
+* Keep ML isolated:
+
+  ```powershell
+  # keep your branch current with services-pipeline (no merge commits)
+  git fetch origin
+  git rebase origin/feat/services-pipeline
+  # resolve, test, then push
+  git push --force-with-lease
+  ```
+* When services work is merged to `develop`, **rebase ML onto `develop`** once, then open a PR from `feat/ml/baseline-v2` → `develop`.
 
 ---
 
 ## What changed since the last snapshot 🔄
 
-* **Added** `services/parser.py` and `services/scan_pipeline.py`.
-* **Kept** existing HTML flow (`POST /scan` in `pages.py`) using `classify_text` — pipeline is ready but not yet wired into routes.
-* **Improved** scans API CSV export and docs grouping (tags).
-* **Shared** `get_db()` moved to `app/db.py` (routes can be DRY’d to use it).
+* Added full **ML baseline** (trainer, predictor, metrics & plots, thresholds in JSON).
+* Added **public data prep** scripts + processed corpora.
+* Trained first **LR model** with measurable metrics; CLI **reasons** working.
+* Implemented optional **ensemble flag** (kept off in app; CLI only).
+* No changes to `app/services` yet (by design).
 
 ---
 
 ## Smoke checklist (now)
 
-* Run app:
+* Train (fast footprint)
 
+  ```powershell
+  python scripts\train_baseline.py `
+    --inputs data\processed\mix_balanced.csv `
+    --val-size 0.2 --seed 42 `
+    --max-features-word 80000 --max-features-char 80000 `
+    --out models\tfidf_lr_fast.joblib
   ```
-  uvicorn app.main:app --reload
+* Predict (CLI)
+
+  ```powershell
+  python scripts\predict.py --model models\tfidf_lr_fast.joblib `
+    "verify your account urgently to continue" `
+    "free gift voucher click here" `
+    "team lunch next Thursday at 12"
   ```
-* Hit:
+* Inspect metrics & threshold suggestions
 
-  * `/` (form), `/history`, `/scan/{id}/view`
-  * `/docs` & `/openapi.json`
-  * `/export/csv?label=safe&date_from=2025-01-01`
-  * `/health`, `/_debug/scan_count`
-* Quick pipeline demo (optional REPL):
-
-  ```py
-  from sqlalchemy.orm import Session
-  from sqlalchemy import create_engine
-  from app.services.scan_pipeline import create_scan_from_text
-  from app.models import Scan
-
-  e = create_engine("sqlite:///phishblocker.db", future=True)
-  from sqlalchemy.orm import Session
-  with Session(e) as s:
-      sc = create_scan_from_text(s, "Please verify your account at http://1.2.3.4/login", subject="Action required", sender="it@corp.com")
-      print(sc.id, sc.label, sc.confidence, sc.email_id)
+  ```powershell
+  python - << 'PY'
   ```
+
+import json, pprint
+m="models/tfidf\_lr\_fast.metrics.json"
+pp=json.load(open(m,encoding="utf-8"))
+print("Macro-F1:", round(pp\["metrics"]\["macro avg"]\["f1-score"],3))
+print("Threshold suggestions:"); pprint.pp(pp.get("threshold\_suggestions",{}))
+PY
+
+```
 
 ---
 
 ## Roadmap (updated)
 
-### M1 — MVP polish (Local) · in progress
+### M1 — MVP polish (Local) · **in progress**
+- [ ] Wire `pages.py` `POST /scan` to `create_scan_from_text(...)` (persist Email+Scan consistently).
+- [ ] Add `/api/scan (POST)` + `/api/scans (GET)`.
+- [ ] Use **LR artifact** only (no ensemble) in the first wiring.
 
-* [ ] Switch `pages.py` **POST /scan** to use `create_scan_from_text` (persists Email + Scan consistently).
-* [ ] Add **/api/scan (POST)** and **/api/scans (GET)** endpoints (JSON clients).
-* [ ] Basic tests:
+### M2 — Data & thresholds · **next**
+- [ ] Increase minority examples (add modern phishing corpora; de-dup; basic cleaning).
+- [ ] Downsample safe or up-weight hard negatives; evaluate.
+- [ ] Adopt **threshold_suggestions** from metrics JSON for UI defaults (e.g., quarantine if P(phishing) ≥ T\_98P).
 
-  * Unit: `classify_text()` & `analyze(parsed)`
-  * Integration: `POST /scan` persists ↔ `GET /scan/{id}` returns; CSV export filters.
-
-### M2 — Gmail ingestion
-
-* OAuth + token capture → fetch `.eml` → feed **create\_scan\_from\_eml\_bytes** → show in History.
-* Optional: webhook (`/webhooks/gmail`) later; start with pull.
-
-### M3 — ML baseline
-
-* TF-IDF + Logistic Regression (+ calibration); joblib with version string.
-* Integrate via `model.predict_with_explanations(text, meta)` in pipeline.
+### M3 — Services integration (ML) · **after M1/M2**
+- [ ] Add `app/services/model.py` (or extend existing) to load joblib once and expose:
+`predict_with_explanations(text) -> (label, prob, reasons)`.
+- [ ] If classifier is an ensemble, pull LR sub-estimator coefficients for “reasons”.
+- [ ] Make thresholds configurable via env or DB.
 
 ### M4 — Feedback & filters
+- [ ] Feedback table + “Correct label” UI.
+- [ ] History filters: label/date/sender search.
 
-* Detail page: “Correct label” (Safe/Spam/Phish) + notes → table `feedback` for retraining.
-* History filters: label/date/sender text search.
-
-### M5 — Packaging & CI
-
-* Docker + Alembic on startup; GitHub Actions (lint/test/build).
-* Structured logs; basic metrics.
+### M5 — CI & packaging
+- [ ] Pre-commit, pytest, GitHub Actions (lint/test/build).
+- [ ] Docker image; Alembic on startup.
 
 ### M6 — Safety & retention
-
-* TTL for raw bodies; purge job; security headers; rate limiting.
+- [ ] TTL for raw bodies; purge jobs; security headers; rate limiting.
 
 ---
 
-## Risks & guardrails
+## Git recommendations (future-proofing)
 
-* **Dataset drift**: include modern ham + adversarial phish (punycode/IP/shorteners).
-* **Webhook idempotency (future)**: dedupe by Gmail `messageId`/`historyId`.
-* **Explainability**: reasons from top features + heuristics flags.
-* **SQLite locking**: mitigated with WAL + busy\_timeout; can move to Postgres when deploying.
+**Branching**
+- Keep features on short-lived branches: `feat/<area>-<slug>`.
+- Rebase feature branches onto the target (no long-running diverged histories).
+- Prefer **squash & merge** for clean history.
+
+**PRs**
+- Small, single-purpose PRs (≤ 400 lines diff ideally).
+- Template with: What/Why/How/Test plan/Risks.
+- CODEOWNERS for app vs. ML reviewers.
+
+**Versioning & artifacts**
+- Don’t commit data or model binaries. Keep `data/**` and `models/**` in `.gitignore`.
+- Tag code-only releases, not model files:  
+`git tag ml/v2-<yyyy-mm-dd>` on commit that produced the artifact.
+- Store artifacts in a bucket or release storage, and record the path/URI in `*.metrics.json` (we already save metadata; we can add an `artifact_uri` later).
+
+**.gitignore / large files**
+- Ensure `.db`, `*.joblib`, `*.png`, `*.json` under `models/`, and `data/raw|processed/` are ignored (looks good already).
+
+**Quality gates**
+- Add `pre-commit` (black, ruff, isort), basic `pytest -q`, and mypy (optional) before merging to `develop`.
 
 ---
 
 ## Immediate next steps (pick one)
 
-**A) Wire the pipeline (quick win)**
+**A) Wire LR into the app (small PR)**
+- Add `app/services/model.py` (loader + `predict_with_explanations` using LR).
+- In `scan_pipeline.py`, optionally call the model; store `label`, `confidence`, and “reasons”.
+- Update `POST /scan` to use pipeline.
 
-* Change `pages.py` `POST /scan` to call `create_scan_from_text(...)`.
-* Add `POST /api/scan` (accepts `body_text` or raw `.eml` upload) using pipeline.
-* Return `{scan_id, email_id, label, confidence, reasons, header_flags}`.
+**B) Improve data balance**
+- Create a balanced training set (downsample safe, or stratified cap per class), retrain LR, compare Macro-F1 & phishing precision.
 
-**B) Tests & CI**
+**C) Evaluate ensemble (offline)**
+- Train with `--ensemble`, compare phishing PR-AUC & Macro-F1. If it wins without latency pain, we’ll add the explanation shim and consider promoting it.
 
-* Add 3–5 unit tests + 1 integration, wire `pytest` in GH Actions.
-
-**C) Model baseline**
-
-* Start a simple TF-IDF LR; store `model_version`, return top reasons.
-
-Tell me which track you want next and I’ll drop in the exact code changes (no churn, minimal diff).
+Tell me which track you want to execute right now, and I’ll drop the exact diff/patch (tiny, focused) to get it done.
+::contentReference[oaicite:0]{index=0}
+```
