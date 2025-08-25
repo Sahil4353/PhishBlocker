@@ -42,4 +42,9 @@ Thumbs.db
 /models/*.joblib
 models/*.png
 models/*.json
-phishblocker.db*
+phishblocker.db*# === Data & models (keep directories, ignore contents) ===
+data/**
+!data/raw/README.md
+!data/raw/**/.gitkeep
+models/**
+!models/*.md
