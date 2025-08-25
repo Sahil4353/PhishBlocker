@@ -19,8 +19,10 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import sklearn
 from scipy.sparse import csr_matrix
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import VotingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -30,8 +32,10 @@ from sklearn.metrics import (
     precision_recall_curve,
 )
 from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import LinearSVC
 
 # ---------- helpers ----------
 CANON_LABELS = {
@@ -73,7 +77,7 @@ def load_concat(inputs: List[str]) -> pd.DataFrame:
     return out, sha256s
 
 
-def build_pipeline(max_features_word: int, max_features_char: int) -> Pipeline:
+def build_vectorizer(max_features_word: int, max_features_char: int) -> FeatureUnion:
     word_tfidf = (
         "w_tfidf",
         TfidfVectorizer(
@@ -96,15 +100,61 @@ def build_pipeline(max_features_word: int, max_features_char: int) -> Pipeline:
             lowercase=False,
         ),
     )
-    features = FeatureUnion([word_tfidf, char_tfidf])
+    return FeatureUnion([word_tfidf, char_tfidf])
 
-    # Logistic Regression (saga) with class_weight balanced
-    clf = LogisticRegression(
-        solver="saga", penalty="l2", max_iter=2000, n_jobs=-1, class_weight="balanced"
+
+def build_lr(seed: int = 42):
+    return LogisticRegression(
+        solver="saga",
+        penalty="l2",
+        max_iter=2000,
+        n_jobs=-1,
+        class_weight="balanced",
+        random_state=seed,
+        verbose=1,
     )
-    # Keep option to calibrate later; for now LR probs are fine.
-    model = Pipeline([("features", features), ("clf", clf)])
-    return model
+
+
+def build_nb():
+    # NB is fast; TF-IDF works fine in practice for a baseline
+    return MultinomialNB(alpha=0.1)
+
+
+def build_svm_calibrated():
+    base = LinearSVC(dual="auto", class_weight="balanced")
+    # Platt scaling for probabilities
+    return CalibratedClassifierCV(base_estimator=base, method="sigmoid", cv=3)
+
+
+def build_pipeline_single(
+    max_features_word: int, max_features_char: int, seed: int
+) -> Pipeline:
+    features = build_vectorizer(max_features_word, max_features_char)
+    clf = build_lr(seed)
+    return Pipeline([("features", features), ("clf", clf)])
+
+
+def build_pipeline_ensemble(
+    max_features_word: int, max_features_char: int, seed: int
+) -> Pipeline:
+    features = build_vectorizer(max_features_word, max_features_char)
+
+    lr = build_lr(seed)
+    nb = build_nb()
+    svm = build_svm_calibrated()
+
+    ensemble = VotingClassifier(
+        estimators=[
+            ("lr", lr),
+            ("nb", nb),
+            ("svm", svm),
+        ],
+        voting="soft",
+        weights=[2.0, 1.0, 1.5],  # tweak after seeing metrics
+        n_jobs=-1,
+        flatten_transform=True,
+    )
+    return Pipeline([("features", features), ("clf", ensemble)])
 
 
 def plot_confusion(cm: np.ndarray, classes: List[str], out_png: str) -> None:
@@ -163,6 +213,12 @@ def main():
     ap.add_argument(
         "--out", required=True, help="Joblib path, e.g., models/tfidf_lr_v1.joblib"
     )
+    ap.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="Use LR+NB+calibrated LinearSVM soft-voting ensemble",
+    )
+
     args = ap.parse_args()
 
     out_path = Path(args.out)
@@ -184,7 +240,16 @@ def main():
     )
 
     print("[*] Building pipeline…")
-    pipe = build_pipeline(args.max_features_word, args.max_features_char)
+    if args.ensemble:
+        pipe = build_pipeline_ensemble(
+            args.max_features_word, args.max_features_char, args.seed
+        )
+    else:
+        pipe = build_pipeline_single(
+            args.max_features_word, args.max_features_char, args.seed
+        )
+
+    print(f"    Pipeline: {pipe}")
 
     print("[*] Training…")
     t0 = time.time()
@@ -225,10 +290,12 @@ def main():
 
     # metadata
     meta: Dict = {
-        "model_name": "tfidf_word+char_lr",
+        "model_name": "tfidf_word+char_ensemble"
+        if args.ensemble
+        else "tfidf_word+char_lr",
         "version": "v2",
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "scikit_learn_version": joblib.__version__,  # joblib version too
+        "scikit_learn_version": sklearn.__version__,  # joblib version too
         "params": {
             "word_ngram": [1, 2],
             "char_ngram": [3, 5],
@@ -252,6 +319,13 @@ def main():
         },
         "classes": classes,
     }
+
+    if args.ensemble:
+        meta["ensemble"] = {
+            "estimators": ["lr", "nb", "svm(calibrated)"],
+            "weights": [2.0, 1.0, 1.5],
+            "calibration": {"svm": "Platt(sigmoid)", "cv": 3},
+        }
 
     # save bundle
     print(f"[*] Saving artifact → {out_path}")
