@@ -1,83 +1,122 @@
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
-
-from app.core.logging import get_logger
-
-logger = get_logger(__name__)
-
-# --- Patterns (keep simple & fast for now) ---
-PHISH_PATTERNS = [
-    r"\bverify your (?:account|password)\b",
-    r"\burgent action required\b",
-    r"\bclick (?:here|the link)\b",
-    r"\bconfirm your (?:details|identity)\b",
-]
-SPAM_PATTERNS = [
-    r"\bfree\s+money\b",
-    r"\bwinner\b",
-    r"\bwork from home\b",
-    r"\bweight loss\b",
-]
-
-# Try to compile regexes once at import time. If anything fails, we degrade gracefully.
-try:
-    PHISH_REGEX = [re.compile(p, re.I) for p in PHISH_PATTERNS]
-    SPAM_REGEX = [re.compile(p, re.I) for p in SPAM_PATTERNS]
-except re.error as e:
-    logger.exception("Regex compilation failed; disabling heuristics: %s", e)
-    PHISH_REGEX, SPAM_REGEX = [], []
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 
-def _excel_reason(patterns: List[str]) -> List[str]:
-    """Map raw regex patterns to human-readable reasons (kept simple)."""
-    return [f"matched: {p}" for p in patterns]
-
-
+# --- Public API kept the same for pages.py ---
 def classify_text(text: str) -> Tuple[str, float, List[str]]:
     """
-    Heuristic classifier with defensive guards.
-
-    Returns:
-        (label, confidence, reasons[])
-    Notes:
-        - Prefers 'phishing' over 'spam' if both match.
-        - Confidence scales with number of hits.
-        - Never raises: on any error, returns ('safe', 0.50, [...]) and logs.
+    Very light baseline heuristics for text-only classification.
+    Returns (label, confidence, reasons). Labels: safe|spam|phishing
     """
+    text_l = (text or "").lower()
+    reasons: List[str] = []
+    score = 0.0
+
+    # Signals
+    urgent = any(
+        p in text_l
+        for p in (
+            "urgent",
+            "immediately",
+            "verify your account",
+            "password expiry",
+            "final notice",
+            "suspend",
+            "limited time",
+            "unauthorized",
+            "confirm your identity",
+        )
+    )
+    if urgent:
+        score += 0.35
+        reasons.append("urgent language")
+
+    # Links that look odd (IP / punycode / at-signs before domain)
+    urls = re.findall(r"https?://\S+", text or "")
+    has_ip_url = any(_looks_like_ip(url) for url in urls)
+    has_puny = any("xn--" in url for url in urls)
+    if has_ip_url:
+        score += 0.35
+        reasons.append("url uses raw ip")
+    if has_puny:
+        score += 0.2
+        reasons.append("punycode url")
+
+    # Credential bait
+    cred_bait = any(
+        p in text_l
+        for p in ("update your password", "login now", "re-enter your details")
+    )
+    if cred_bait:
+        score += 0.25
+        reasons.append("credential lure")
+
+    # Marketing-y (spammy) signals
+    spammy = any(
+        p in text_l
+        for p in ("free trial", "special offer", "unsubscribe", "act now", "win a")
+    )
+    if spammy and score < 0.5:
+        reasons.append("marketing language")
+
+    # Decide
+    if score >= 0.6:
+        return ("phishing", min(0.99, 0.5 + score / 2), reasons)
+    if spammy:
+        return ("spam", 0.6, reasons)
+    return ("safe", 0.7 if not (urgent or cred_bait or urls) else 0.5, reasons)
+
+
+def _looks_like_ip(url: str) -> bool:
     try:
-        if not PHISH_REGEX and not SPAM_REGEX:
-            logger.warning("Heuristics disabled (regex not compiled)")
-            return "safe", 0.50, ["heuristics unavailable"]
+        host = urlparse(url).hostname or ""
+        return bool(re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host))
+    except Exception:
+        return False
 
-        # Normalize defensively; cap extremely long bodies to avoid pathological regex time.
-        t = (text or "").strip()
-        if len(t) > 200_000:
-            logger.info("Input truncated from %d to 200000 chars for safety", len(t))
-            t = t[:200_000]
 
-        hits_phish = [r.pattern for r in PHISH_REGEX if r.search(t)]
-        hits_spam = [r.pattern for r in SPAM_REGEX if r.search(t)]
+# --- Header/URL analyzer for pipeline JSON (booleans/ints only) ---
+def analyze(parsed: Dict) -> Dict:
+    """
+    Analyze parsed email dict (from services.parser.parse_rfc822).
+    Returns JSON-serializable flags for storage in Scan.header_flags.
+    """
+    sender = parsed.get("sender") or ""
+    reply_to = parsed.get("reply_to") or ""
+    return_path = parsed.get("return_path") or ""
 
-        if hits_phish:
-            conf = min(0.70 + 0.10 * len(hits_phish), 0.99)
-            reasons = _excel_reason(hits_phish)
-            logger.debug(
-                "Heuristic result: phishing conf=%.2f hits=%s", conf, hits_phish
-            )
-            return "phishing", conf, reasons
+    sender_dom = _domain(sender)
+    reply_dom = _domain(reply_to)
+    ret_dom = _domain(return_path)
 
-        if hits_spam:
-            conf = min(0.60 + 0.10 * len(hits_spam), 0.95)
-            reasons = _excel_reason(hits_spam)
-            logger.debug("Heuristic result: spam conf=%.2f hits=%s", conf, hits_spam)
-            return "spam", conf, reasons
+    reply_mismatch = bool(sender_dom and reply_dom and sender_dom != reply_dom)
+    return_mismatch = bool(sender_dom and ret_dom and sender_dom != ret_dom)
 
-        logger.debug("Heuristic result: safe")
-        return "safe", 0.50, ["no suspicious patterns found"]
+    spf = (parsed.get("spf_result") or "").lower()
+    dkim = (parsed.get("dkim_result") or "").lower()
+    dmarc = (parsed.get("dmarc_result") or "").lower()
 
-    except Exception as e:
-        # Absolute safety: never break the request because of heuristics.
-        logger.exception("Heuristic classification failed: %s", e)
-        return "safe", 0.50, ["heuristic error; defaulted to safe"]
+    urls = parsed.get("urls") or []
+    has_ip = any(_looks_like_ip(u) for u in urls)
+    has_puny = any("xn--" in (u or "") for u in urls)
+
+    return {
+        "has_html": int(bool(parsed.get("has_html"))),
+        "has_text": int(bool(parsed.get("has_text"))),
+        "urls_count": int(len(urls)),
+        "url_has_ip": int(has_ip),
+        "url_has_punycode": int(has_puny),
+        "reply_to_mismatch": int(reply_mismatch),
+        "return_path_mismatch": int(return_mismatch),
+        "spf_fail": int(spf == "fail"),
+        "dkim_fail": int(dkim == "fail"),
+        "dmarc_fail": int(dmarc == "fail"),
+    }
+
+
+def _domain(addr: str) -> str:
+    m = re.search(r"@([A-Za-z0-9.-]+)", addr or "")
+    return m.group(1).lower() if m else ""
