@@ -37,14 +37,16 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
-/data/raw/
-/data/processed/*.csv
-/models/*.joblib
-models/*.png
-models/*.json
-phishblocker.db*# === Data & models (keep directories, ignore contents) ===
-data/**
-!data/raw/README.md
-!data/raw/**/.gitkeep
-models/**
-!models/*.md
+
+# === Data & models (ignore contents, keep structure) ===
+data/*
+!data/
+!data/.gitkeep
+!data/raw/
+!data/raw/.gitkeep
+!data/processed/
+!data/processed/.gitkeep
+
+models/*
+!models/
+!models/.gitkeep
