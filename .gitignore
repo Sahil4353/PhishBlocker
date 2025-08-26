@@ -40,7 +40,10 @@ Thumbs.db
 
 # === Data & models (ignore contents, keep structure) ===
 data/**
+!data/
 !data/.gitkeep
+!data/README.md
+!data/**/*.md
 !data/raw/
 !data/raw/.gitkeep
 !data/processed/
