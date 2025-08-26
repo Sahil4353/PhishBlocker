@@ -39,14 +39,13 @@ Thumbs.db
 *.db-shm
 
 # === Data & models (ignore contents, keep structure) ===
-data/*
-!data/
+data/**
 !data/.gitkeep
 !data/raw/
 !data/raw/.gitkeep
 !data/processed/
 !data/processed/.gitkeep
 
-models/*
-!models/
-!models/.gitkeep
+# Ignore CSV and Parquet specifically
+data/**/*.csv
+data/**/*.parquet
