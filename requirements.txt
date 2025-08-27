@@ -4,3 +4,9 @@ numpy>=1.24
 scipy>=1.10
 pandas>=2.0
 matplotlib>=3.7
+seaborn>=0.13
+
+# Torch stack (CUDA 12.1 build)
+torch>=2.5.1+cu121
+torchvision>=0.20.1+cu121
+torchaudio>=2.5.1+cu121
