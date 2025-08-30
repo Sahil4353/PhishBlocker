@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 """
-TF-IDF + (PyTorch) multinomial Logistic Regression
-- Sparse CSR -> dense per-sample on the fly (no giant toarray()).
-- Mini-batches, CUDA, mixed precision, class weights / weighted sampling.
-- Saves torch state_dict + sklearn artifacts + metrics JSON.
+TF-IDF + PyTorch Logistic Regression (GPU-ready)
+- Word + Char TF-IDF (optional) with sparse hstack
+- Mini-batch training from CSR without building giant dense matrices
+- Mixed precision (AMP), class weights, optional weighted sampler
+- Binary mode (safe vs not_safe) with threshold tuning
+- Temperature scaling for probability calibration
+- Saves: model state_dict, sklearn artifacts (joblib), metrics JSON, and plots (PR, ROC, CM)
 """
 
 import argparse
@@ -16,17 +19,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import joblib
+import matplotlib
 import numpy as np
 import pandas as pd
 import sklearn
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
 
 log = logging.getLogger("train_baseline")
 
@@ -53,6 +69,7 @@ CANON_LABELS = {
     "phishing": "phishing",
     "fraud": "phishing",
 }
+BIN_MAP = {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
 
 
 def _canonicalize_label(x: str) -> Optional[str]:
@@ -62,7 +79,7 @@ def _canonicalize_label(x: str) -> Optional[str]:
     return CANON_LABELS.get(s, s)
 
 
-# ------------------------- data loading -------------------------
+# ------------------------- IO -------------------------
 def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     frames, sha256s = [], []
     for p in inputs:
@@ -81,7 +98,6 @@ def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
         df["label"] = df["label"].map(_canonicalize_label)
         df = df[["body_text", "label"]].copy()
         frames.append(df)
-
         try:
             sha256s.append(hashlib.sha256(pth.read_bytes()).hexdigest())
         except Exception:
@@ -101,7 +117,6 @@ def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
 
     if len(out) == 0:
         raise SystemExit("[ERR] No rows left after cleaning. Check your inputs.")
-
     return out, sha256s
 
 
@@ -115,9 +130,21 @@ class TorchLogReg(nn.Module):
         return self.linear(x)
 
 
+class TemperatureScaler(nn.Module):
+    """Single-parameter temperature scaling for logits."""
+
+    def __init__(self):
+        super().__init__()
+        self.logT = nn.Parameter(torch.zeros(1))  # T = exp(logT) >= 0
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        T = torch.exp(self.logT)
+        return logits / T
+
+
 # ------------------------- dataset (CSR -> dense per item) -------------------------
 class CSRDataset(Dataset):
-    def __init__(self, X_csr, y_np: np.ndarray):
+    def __init__(self, X_csr: csr_matrix, y_np: np.ndarray):
         self.X = X_csr
         self.y = y_np.astype(np.int64)
 
@@ -125,20 +152,21 @@ class CSRDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        # Pull a single sparse row and convert to dense float32
-        row = self.X[idx]
-        # row is 1 x D; convert efficiently without building the whole matrix
+        row = self.X[idx]  # 1 x D
         x = torch.from_numpy(row.toarray().astype(np.float32, copy=False)).squeeze(0)
         y = int(self.y[idx])
         return x, y
 
 
-# ------------------------- training loop -------------------------
-def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
+# ------------------------- training / eval -------------------------
+def train_epoch(
+    model, loader, optimizer, criterion, device, use_amp, accum_steps
+) -> float:
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
+    step = 0
 
     for step, (xb, yb) in enumerate(loader, 1):
         xb = xb.to(device, non_blocking=True)
@@ -146,46 +174,141 @@ def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_step
 
         with torch.autocast(device_type="cuda", enabled=use_amp):
             logits = model(xb)
-            loss = criterion(logits, yb)
-            loss = loss / accum_steps
+            loss = criterion(logits, yb) / accum_steps
 
         scaler.scale(loss).backward()
-
         if step % accum_steps == 0:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
         running_loss += loss.detach().item()
 
-    # flush remaining grads
-    if (step % accum_steps) != 0:
+    if step and (step % accum_steps) != 0:
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
-
     return running_loss / max(1, len(loader))
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, classes: List[str]):
+def predict_logits(model, loader, device) -> np.ndarray:
     model.eval()
-    all_preds, all_true = [], []
-    for xb, yb in loader:
+    chunks = []
+    for xb, _ in loader:
         xb = xb.to(device, non_blocking=True)
-        logits = model(xb)
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-        all_preds.append(preds)
-        all_true.append(np.asarray(yb))
-    y_pred = np.concatenate(all_preds)
-    y_true = np.concatenate(all_true)
+        logits = model(xb).detach().cpu().numpy()
+        chunks.append(logits)
+    return np.vstack(chunks)
 
-    acc = (y_pred == y_true).mean().item()
+
+@torch.no_grad()
+def evaluate(
+    model, loader, device, classes: List[str]
+) -> Tuple[float, Dict, List[List[int]]]:
+    logits = predict_logits(model, loader, device)
+    preds = logits.argmax(axis=1)
+    y_true = (
+        np.concatenate([np.asarray(y) for _, y in loader.dataset.__iter__()])
+        if False
+        else None
+    )  # Not used
+
+    # Rebuild y_true from loader (safe way)
+    ys = []
+    for _, yb in loader:
+        ys.append(np.asarray(yb))
+    y_true = np.concatenate(ys)
+
+    acc = (preds == y_true).mean().item()
     report = classification_report(
-        y_true, y_pred, target_names=classes, output_dict=True
+        y_true, preds, target_names=classes, output_dict=True
     )
-    cm = confusion_matrix(y_true, y_pred).tolist()
+    cm = confusion_matrix(y_true, preds).tolist()
     return acc, report, cm
+
+
+def tune_temperature(
+    model, loader, device, num_classes: int, max_iter: int = 200
+) -> float:
+    """Fits temperature (NLL on val set). Returns T as float."""
+    model.eval()
+    scaler = TemperatureScaler().to(device)
+    optimizer = optim.LBFGS(
+        scaler.parameters(), lr=0.5, max_iter=max_iter, line_search_fn="strong_wolfe"
+    )
+    nll = nn.CrossEntropyLoss()
+
+    xs, ys = [], []
+    for xb, yb in loader:
+        xs.append(xb.to(device, non_blocking=True))
+        ys.append(torch.as_tensor(yb, device=device))
+    X = torch.cat(xs, dim=0)
+    Y = torch.cat(ys, dim=0)
+
+    def closure():
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(X)
+        logits_T = scaler(logits)
+        loss = nll(logits_T, Y)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    T = float(torch.exp(scaler.logT).detach().cpu().item())
+    return T
+
+
+def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
+    return logits / max(T, 1e-6)
+
+
+# ------------------------- plotting -------------------------
+def _save_plot(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+
+
+def plot_confusion_matrix(cm: List[List[int]], classes: List[str], path: Path):
+    arr = np.asarray(cm)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(arr, interpolation="nearest")
+    ax.set_title("Confusion Matrix")
+    ax.set_xticks(range(len(classes)))
+    ax.set_xticklabels(classes, rotation=45, ha="right")
+    ax.set_yticks(range(len(classes)))
+    ax.set_yticklabels(classes)
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            ax.text(j, i, str(arr[i, j]), ha="center", va="center")
+    ax.set_ylabel("True")
+    ax.set_xlabel("Pred")
+    _save_plot(path)
+
+
+def plot_pr_roc(
+    y_true_bin: np.ndarray, prob_pos: np.ndarray, out_pr: Path, out_roc: Path
+):
+    # PR
+    prec, rec, thr = precision_recall_curve(y_true_bin, prob_pos)
+    ap = average_precision_score(y_true_bin, prob_pos)
+    plt.figure(figsize=(5, 4))
+    plt.plot(rec, prec)
+    plt.title(f"Precision-Recall (AP={ap:.3f})")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    _save_plot(out_pr)
+
+    # ROC
+    fpr, tpr, _ = roc_curve(y_true_bin, prob_pos)
+    auc = roc_auc_score(y_true_bin, prob_pos)
+    plt.figure(figsize=(5, 4))
+    plt.plot(fpr, tpr)
+    plt.title(f"ROC (AUC={auc:.3f})")
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    _save_plot(out_roc)
 
 
 # ------------------------- main -------------------------
@@ -195,6 +318,8 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("[*] Loading data…")
     df, sha256s = load_concat(args.inputs)
+    if args.binary:
+        df["label"] = df["label"].map(BIN_MAP)
     class_counts = df["label"].value_counts().to_dict()
     log.info("Rows: %d | Class counts: %s", len(df), class_counts)
 
@@ -202,13 +327,16 @@ def run(args: argparse.Namespace) -> int:
     le = LabelEncoder().fit(df["label"])
     y = le.transform(df["label"])
     classes = list(le.classes_)
+    num_classes = len(classes)
+    log.info("Classes: %s", classes)
 
     X_tr_text, X_te_text, y_tr, y_te = train_test_split(
         X_text, y, test_size=args.val_size, random_state=args.seed, stratify=y
     )
 
-    log.info("[*] Building TF-IDF (max_features=%d)…", args.max_features_word)
-    vect = TfidfVectorizer(
+    # ----- TF-IDF stacks -----
+    log.info("[*] Building word TF-IDF (max_features=%d)…", args.max_features_word)
+    vect_word = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
         max_features=args.max_features_word,
@@ -216,8 +344,29 @@ def run(args: argparse.Namespace) -> int:
         stop_words="english",
         dtype=np.float32,
     )
-    X_tr = vect.fit_transform(X_tr_text)  # CSR
-    X_te = vect.transform(X_te_text)
+    Xw_tr = vect_word.fit_transform(X_tr_text)  # CSR
+    Xw_te = vect_word.transform(X_te_text)
+
+    if args.use_char:
+        log.info(
+            "[*] Building char TF-IDF (ngram=%s, max_features=%d)…",
+            str(tuple(args.char_ngram)),
+            args.max_features_char,
+        )
+        vect_char = TfidfVectorizer(
+            analyzer="char",
+            ngram_range=tuple(args.char_ngram),
+            max_features=args.max_features_char,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        Xc_tr = vect_char.fit_transform(X_tr_text)
+        Xc_te = vect_char.transform(X_te_text)
+        X_tr = hstack([Xw_tr, Xc_tr], format="csr")
+        X_te = hstack([Xw_te, Xc_te], format="csr")
+    else:
+        vect_char = None
+        X_tr, X_te = Xw_tr, Xw_te
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.type == "cuda"
@@ -227,10 +376,9 @@ def run(args: argparse.Namespace) -> int:
     ds_tr = CSRDataset(X_tr, y_tr)
     ds_te = CSRDataset(X_te, y_te)
 
-    # Optional weighted sampling (helps on imbalance)
     if args.weighted_sampler:
-        class_sample_count = np.bincount(y_tr, minlength=len(classes))
-        weights = 1.0 / np.clip(class_sample_count, 1, None)
+        binc = np.bincount(y_tr, minlength=num_classes)
+        weights = 1.0 / np.clip(binc, 1, None)
         sample_weights = weights[y_tr]
         sampler = WeightedRandomSampler(
             torch.from_numpy(sample_weights).double(),
@@ -266,13 +414,13 @@ def run(args: argparse.Namespace) -> int:
 
     # Model
     input_dim = X_tr.shape[1]
-    model = TorchLogReg(input_dim, len(classes)).to(device)
+    model = TorchLogReg(input_dim, num_classes).to(device)
 
-    # Class weights for CE (another way to handle imbalance)
+    # Loss / weights
     weight_t = None
     if args.class_weight == "balanced":
-        binc = np.bincount(y_tr, minlength=len(classes)).astype(np.float32)
-        w = (len(y_tr) / np.clip(binc, 1, None)) / len(classes)
+        binc = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
+        w = (len(y_tr) / np.clip(binc, 1, None)) / num_classes
         weight_t = torch.tensor(w, device=device, dtype=torch.float32)
         log.info("Class weights: %s", w.tolist())
 
@@ -281,6 +429,7 @@ def run(args: argparse.Namespace) -> int:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    # Train
     log.info(
         "[*] Training… (epochs=%d, batch_size=%d, accum=%d)",
         args.epochs,
@@ -302,40 +451,156 @@ def run(args: argparse.Namespace) -> int:
             "Epoch %d/%d | loss=%.5f | val_acc=%.4f", epoch, args.epochs, loss, acc
         )
 
-    acc, report, cm = evaluate(model, te_loader, device, classes)
+    # Temperature scaling (calibration on val)
+    T = None
+    if args.calibrate:
+        log.info("[*] Calibrating probabilities with temperature scaling…")
+        T = tune_temperature(model, te_loader, device, num_classes=num_classes)
+        log.info("Calibrated temperature T=%.4f", T)
+
+    # Final evaluation (with calibration)
+    logits_val = predict_logits(model, te_loader, device)
+    if T is not None:
+        logits_val = apply_temperature(logits_val, T)
+
+    probs_val = torch.softmax(torch.tensor(logits_val), dim=1).numpy()
+    y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
+
+    preds_val = probs_val.argmax(axis=1)
+    acc = (preds_val == y_val).mean().item()
+    report = classification_report(
+        y_val, preds_val, target_names=classes, output_dict=True
+    )
+    cm = confusion_matrix(y_val, preds_val).tolist()
     log.info("[✓] Final val_acc=%.4f", acc)
 
-    # Save bundle
+    # ----- Binary threshold tuning -----
+    tuned_threshold = None
+    pr_curve_png = None
+    roc_curve_png = None
+    if args.binary:
+        # positive = not_safe (i.e., index of that class)
+        pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
+        prob_pos = probs_val[:, pos_idx]
+        y_true_bin = (y_val == pos_idx).astype(int)
+
+        if args.tune_threshold:
+            tuned_threshold = tune_threshold(
+                prob_pos,
+                y_true_bin,
+                metric=args.tune_metric,
+                prec_target=args.precision_target,
+            )
+            log.info(
+                "Tuned threshold (metric=%s): %.4f", args.tune_metric, tuned_threshold
+            )
+
+        # plots
+        out_dir = Path(args.out).parent
+        pr_curve_png = out_dir / "pr_curve.png"
+        roc_curve_png = out_dir / "roc_curve.png"
+        plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
+
+    # ----- Save artifacts -----
     out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    bundle = {
-        "model_state": model.state_dict(),
-        "input_dim": input_dim,
-        "num_classes": len(classes),
-        "vectorizer": vect,  # pickled inside torch.save
-        "label_encoder": le,  # pickled
-        "metadata": {
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-            "scikit_learn_version": sklearn.__version__,
-            "torch_version": torch.__version__,
-            "cuda": getattr(torch.version, "cuda", None),
-            "device": str(device),
-            "classes": classes,
-            "class_distribution": class_counts,
-            "accuracy": acc,
-            "report": report,
-            "confusion_matrix": cm,
-            "params": vars(args),
+    out_dir = out_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save sklearn artifacts separately
+    joblib.dump(vect_word, out_dir / "vectorizer_word.joblib")
+    if vect_char is not None:
+        joblib.dump(vect_char, out_dir / "vectorizer_char.joblib")
+    joblib.dump(le, out_dir / "label_encoder.joblib")
+
+    # Save torch bundle minimal (state only)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "input_dim": input_dim,
+            "num_classes": num_classes,
+        },
+        out_path,
+    )
+
+    # Build metadata
+    metadata = {
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "scikit_learn_version": sklearn.__version__,
+        "torch_version": torch.__version__,
+        "cuda": getattr(torch.version, "cuda", None),
+        "device": str(device),
+        "classes": classes,
+        "class_distribution": class_counts,
+        "accuracy": acc,
+        "report": report,
+        "confusion_matrix": cm,
+        "params": vars(args),
+        "sha256_inputs": sha256s,
+        "temperature": T,
+        "tuned_threshold": tuned_threshold,
+        "plots": {
+            "pr_curve": str(pr_curve_png) if pr_curve_png else None,
+            "roc_curve": str(roc_curve_png) if roc_curve_png else None,
         },
     }
-    torch.save(bundle, out_path)
     with open(out_path.with_suffix(".metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(bundle["metadata"], f, indent=2)
+        json.dump(metadata, f, indent=2)
+
+    # Also save a compact text log of key metrics
+    with open(out_dir / "summary.txt", "w", encoding="utf-8") as f:
+        f.write(f"val_acc={acc:.4f}\n")
+        if tuned_threshold is not None:
+            f.write(f"tuned_threshold={tuned_threshold:.4f}\n")
+        if T is not None:
+            f.write(f"temperature={T:.4f}\n")
+
+    # Save confusion matrix plot
+    plot_confusion_matrix(cm, classes, out_dir / "confusion_matrix.png")
 
     log.info("[✓] Saved model → %s", out_path)
     log.info("[✓] Saved metrics → %s", out_path.with_suffix(".metrics.json"))
+    log.info("[✓] Artifacts: %s", out_dir)
     log.info("[✓] Done in %.1fs", time.time() - t0)
     return 0
+
+
+# ------------------------- threshold tuning -------------------------
+def fbeta(prec: float, rec: float, beta: float) -> float:
+    if prec + rec == 0:
+        return 0.0
+    b2 = beta * beta
+    return (1 + b2) * (prec * rec) / max(b2 * prec + rec, 1e-12)
+
+
+def tune_threshold(
+    prob_pos: np.ndarray,
+    y_true_bin: np.ndarray,
+    metric: str = "f1",
+    prec_target: Optional[float] = None,
+) -> float:
+    # Evaluate on all unique thresholds from PR curve
+    precisions, recalls, thresholds = precision_recall_curve(y_true_bin, prob_pos)
+    thresholds = np.concatenate([thresholds, [1.0]])  # align lengths
+    best_thr, best_score = 0.5, -1.0
+
+    for p, r, t in zip(precisions, recalls, thresholds):
+        if metric == "f1":
+            score = fbeta(p, r, 1.0)
+        elif metric == "f2":
+            score = fbeta(p, r, 2.0)
+        elif metric == "f0.5":
+            score = fbeta(p, r, 0.5)
+        elif metric == "recall":
+            if prec_target is not None and p < prec_target:
+                continue
+            score = r
+        elif metric == "precision":
+            score = p
+        else:
+            score = fbeta(p, r, 1.0)
+        if score > best_score:
+            best_score, best_thr = score, float(t)
+    return float(best_thr)
 
 
 # ------------------------- CLI -------------------------
@@ -350,6 +615,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--val-size", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-features-word", type=int, default=20000)
+    ap.add_argument(
+        "--use-char", action="store_true", help="Enable char TF-IDF and hstack"
+    )
+    ap.add_argument(
+        "--char-ngram",
+        nargs=2,
+        type=int,
+        default=[3, 5],
+        help="Char ngram range, e.g., 3 5",
+    )
+    ap.add_argument("--max-features-char", type=int, default=10000)
+
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument(
@@ -369,8 +646,37 @@ def parse_args() -> argparse.Namespace:
     )
     ap.set_defaults(mixed_precision=True)
     ap.add_argument("--num-workers", type=int, default=2)
+
     ap.add_argument(
-        "--out", required=True, help="Output .pt path (e.g., models/tfidf_lr_torch.pt)"
+        "--binary", action="store_true", help="Collapse labels to safe vs not_safe"
+    )
+    ap.add_argument(
+        "--tune-threshold",
+        action="store_true",
+        help="Tune decision threshold (binary only)",
+    )
+    ap.add_argument(
+        "--tune-metric",
+        choices=["f1", "f2", "f0.5", "recall", "precision"],
+        default="f1",
+    )
+    ap.add_argument(
+        "--precision-target",
+        type=float,
+        default=None,
+        help="For metric=recall, enforce precision >= target",
+    )
+
+    ap.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Enable temperature scaling on validation set",
+    )
+
+    ap.add_argument(
+        "--out",
+        required=True,
+        help="Output model .pt path (e.g., models/tfidf_lr_torch.pt)",
     )
     ap.add_argument("--log-level", default="INFO")
     return ap.parse_args()
