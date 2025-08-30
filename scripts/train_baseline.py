@@ -158,35 +158,95 @@ class CSRDataset(Dataset):
         return x, y
 
 
+def make_loaders(
+    ds_tr, ds_te, y_tr: np.ndarray, num_classes: int, args, device
+) -> tuple[DataLoader, DataLoader]:
+    """High-throughput DataLoaders: more CPU workers, pinned memory, prefetch."""
+    import os
+
+    pin = device.type == "cuda"
+    cpu = max(1, (os.cpu_count() or 4) - 1)
+    num_workers = args.num_workers if args.num_workers is not None else cpu
+    if num_workers <= 0:
+        num_workers = cpu
+
+    common = dict(
+        num_workers=num_workers,
+        pin_memory=pin,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
+
+    if args.weighted_sampler:
+        binc = np.bincount(y_tr, minlength=num_classes)
+        weights = 1.0 / np.clip(binc, 1, None)
+        sample_w = weights[y_tr]
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_w).double(),
+            num_samples=len(sample_w),
+            replacement=True,
+        )
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            **{k: v for k, v in common.items() if v is not None},
+        )
+    else:
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            shuffle=True,
+            **{k: v for k, v in common.items() if v is not None},
+        )
+
+    te_loader = DataLoader(
+        ds_te,
+        batch_size=max(256, args.batch_size),
+        shuffle=False,
+        **{k: v for k, v in common.items() if v is not None},
+    )
+    return tr_loader, te_loader
+
+
 # ------------------------- training / eval -------------------------
-def train_epoch(
-    model, loader, optimizer, criterion, device, use_amp, accum_steps
-) -> float:
+def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
+    """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
-    step = 0
 
+    n_seen = 0
+    t0 = time.time()
     for step, (xb, yb) in enumerate(loader, 1):
         xb = xb.to(device, non_blocking=True)
         yb = torch.as_tensor(yb, device=device)
 
-        with torch.autocast(device_type="cuda", enabled=use_amp):
+        with torch.autocast(
+            device_type=("cuda" if device.type == "cuda" else "cpu"), enabled=use_amp
+        ):
             logits = model(xb)
             loss = criterion(logits, yb) / accum_steps
 
         scaler.scale(loss).backward()
+
         if step % accum_steps == 0:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        running_loss += loss.detach().item()
 
-    if step and (step % accum_steps) != 0:
+        running_loss += loss.detach().item()
+        n_seen += xb.size(0)
+
+    # flush remaining grads
+    if (step % accum_steps) != 0:
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+
+    secs = max(1e-6, time.time() - t0)
+    log.debug("epoch_throughput: %.1f samples/sec", n_seen / secs)
     return running_loss / max(1, len(loader))
 
 
@@ -313,13 +373,22 @@ def plot_pr_roc(
 
 # ------------------------- main -------------------------
 def run(args: argparse.Namespace) -> int:
+    # Performance knobs to push GPU/CPU harder
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+
     setup_logging(args.log_level)
     t0 = time.time()
 
     log.info("[*] Loading data…")
     df, sha256s = load_concat(args.inputs)
-    if args.binary:
-        df["label"] = df["label"].map(BIN_MAP)
+
+    # Optional binary collapse to emphasize recall on not_safe
+    if getattr(args, "binary", False):
+        df["label"] = df["label"].map(
+            {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
+        )
+
     class_counts = df["label"].value_counts().to_dict()
     log.info("Rows: %d | Class counts: %s", len(df), class_counts)
 
@@ -334,7 +403,7 @@ def run(args: argparse.Namespace) -> int:
         X_text, y, test_size=args.val_size, random_state=args.seed, stratify=y
     )
 
-    # ----- TF-IDF stacks -----
+    # --- TF-IDF stacks ---
     log.info("[*] Building word TF-IDF (max_features=%d)…", args.max_features_word)
     vect_word = TfidfVectorizer(
         analyzer="word",
@@ -344,19 +413,20 @@ def run(args: argparse.Namespace) -> int:
         stop_words="english",
         dtype=np.float32,
     )
-    Xw_tr = vect_word.fit_transform(X_tr_text)  # CSR
+    Xw_tr = vect_word.fit_transform(X_tr_text)
     Xw_te = vect_word.transform(X_te_text)
 
-    if args.use_char:
+    vect_char = None
+    if getattr(args, "use_char", False):
         log.info(
             "[*] Building char TF-IDF (ngram=%s, max_features=%d)…",
-            str(tuple(args.char_ngram)),
-            args.max_features_char,
+            str(tuple(getattr(args, "char_ngram", (3, 5)))),
+            getattr(args, "max_features_char", 10000),
         )
         vect_char = TfidfVectorizer(
             analyzer="char",
-            ngram_range=tuple(args.char_ngram),
-            max_features=args.max_features_char,
+            ngram_range=tuple(getattr(args, "char_ngram", (3, 5))),
+            max_features=getattr(args, "max_features_char", 10000),
             sublinear_tf=True,
             dtype=np.float32,
         )
@@ -365,58 +435,21 @@ def run(args: argparse.Namespace) -> int:
         X_tr = hstack([Xw_tr, Xc_tr], format="csr")
         X_te = hstack([Xw_te, Xc_te], format="csr")
     else:
-        vect_char = None
         X_tr, X_te = Xw_tr, Xw_te
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pin = device.type == "cuda"
-    log.info("Device: %s | AMP: %s | pin_memory: %s", device, args.mixed_precision, pin)
+    log.info("Device: %s | AMP: %s", device, args.mixed_precision)
 
-    # Dataset / Loader
+    # Datasets / Loaders (aggressively use CPU for loading)
     ds_tr = CSRDataset(X_tr, y_tr)
     ds_te = CSRDataset(X_te, y_te)
-
-    if args.weighted_sampler:
-        binc = np.bincount(y_tr, minlength=num_classes)
-        weights = 1.0 / np.clip(binc, 1, None)
-        sample_weights = weights[y_tr]
-        sampler = WeightedRandomSampler(
-            torch.from_numpy(sample_weights).double(),
-            num_samples=len(sample_weights),
-            replacement=True,
-        )
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers,
-            pin_memory=pin,
-            persistent_workers=False,
-        )
-    else:
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=pin,
-            persistent_workers=False,
-        )
-
-    te_loader = DataLoader(
-        ds_te,
-        batch_size=max(256, args.batch_size),
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin,
-        persistent_workers=False,
-    )
+    tr_loader, te_loader = make_loaders(ds_tr, ds_te, y_tr, num_classes, args, device)
 
     # Model
     input_dim = X_tr.shape[1]
     model = TorchLogReg(input_dim, num_classes).to(device)
 
-    # Loss / weights
+    # Loss: prioritize recall on positive class by class_weight='balanced'
     weight_t = None
     if args.class_weight == "balanced":
         binc = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
@@ -429,7 +462,34 @@ def run(args: argparse.Namespace) -> int:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
-    # Train
+    # ---- Train with "best-by-recallish" early model save ----
+    best_metric = -1.0
+    best_state = None
+
+    # In binary mode, evaluate each epoch with an F2-like score on val probs.
+    def _val_recallish_score(current_model) -> float:
+        logits = predict_logits(current_model, te_loader, device)
+        probs = torch.softmax(torch.tensor(logits), dim=1).numpy()
+        y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
+
+        if getattr(args, "binary", False):
+            # Recall-heavy score: F2 at a tuned threshold
+            cls = np.array(classes)
+            pos_idx = int(np.where(cls == "not_safe")[0][0])
+            prob_pos = probs[:, pos_idx]
+            thr = tune_threshold(prob_pos, (y_val == pos_idx).astype(int), metric="f2")
+            y_hat = (prob_pos >= thr).astype(int)
+            # compute F2
+            from sklearn.metrics import fbeta_score
+
+            return float(fbeta_score((y_val == pos_idx).astype(int), y_hat, beta=2.0))
+        else:
+            # multiclass macro recall
+            from sklearn.metrics import recall_score
+
+            y_pred = probs.argmax(axis=1)
+            return float(recall_score(y_val, y_pred, average="macro"))
+
     log.info(
         "[*] Training… (epochs=%d, batch_size=%d, accum=%d)",
         args.epochs,
@@ -446,54 +506,57 @@ def run(args: argparse.Namespace) -> int:
             args.mixed_precision,
             args.accum_steps,
         )
-        acc, _, _ = evaluate(model, te_loader, device, classes)
+
+        # quick val metric focusing on recall
+        score = _val_recallish_score(model)
         log.info(
-            "Epoch %d/%d | loss=%.5f | val_acc=%.4f", epoch, args.epochs, loss, acc
+            "Epoch %d/%d | loss=%.5f | recallish=%.4f", epoch, args.epochs, loss, score
         )
 
-    # Temperature scaling (calibration on val)
+        if score > best_metric:
+            best_metric = score
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            log.debug("New best checkpoint (recallish=%.4f)", best_metric)
+
+    # load best
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Optional temperature scaling
     T = None
-    if args.calibrate:
-        log.info("[*] Calibrating probabilities with temperature scaling…")
+    if getattr(args, "calibrate", False):
+        log.info("[*] Calibrating probabilities (temperature scaling)…")
         T = tune_temperature(model, te_loader, device, num_classes=num_classes)
         log.info("Calibrated temperature T=%.4f", T)
 
-    # Final evaluation (with calibration)
+    # Final eval
     logits_val = predict_logits(model, te_loader, device)
     if T is not None:
         logits_val = apply_temperature(logits_val, T)
-
     probs_val = torch.softmax(torch.tensor(logits_val), dim=1).numpy()
     y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
 
-    preds_val = probs_val.argmax(axis=1)
-    acc = (preds_val == y_val).mean().item()
-    report = classification_report(
-        y_val, preds_val, target_names=classes, output_dict=True
-    )
-    cm = confusion_matrix(y_val, preds_val).tolist()
-    log.info("[✓] Final val_acc=%.4f", acc)
-
-    # ----- Binary threshold tuning -----
+    # Threshold tuning for binary with precision floor (good recall with “good” precision)
     tuned_threshold = None
     pr_curve_png = None
     roc_curve_png = None
-    if args.binary:
-        # positive = not_safe (i.e., index of that class)
+    if getattr(args, "binary", False):
         pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
         prob_pos = probs_val[:, pos_idx]
         y_true_bin = (y_val == pos_idx).astype(int)
 
-        if args.tune_threshold:
-            tuned_threshold = tune_threshold(
-                prob_pos,
-                y_true_bin,
-                metric=args.tune_metric,
-                prec_target=args.precision_target,
-            )
-            log.info(
-                "Tuned threshold (metric=%s): %.4f", args.tune_metric, tuned_threshold
-            )
+        # prioritize recall subject to reasonable precision (0.90 default)
+        precision_target = 0.90
+        tuned_threshold = tune_threshold(
+            prob_pos, y_true_bin, metric="recall", prec_target=precision_target
+        )
+        log.info(
+            "Tuned threshold for recall@P>=%.2f: %.4f",
+            precision_target,
+            tuned_threshold,
+        )
 
         # plots
         out_dir = Path(args.out).parent
@@ -501,18 +564,42 @@ def run(args: argparse.Namespace) -> int:
         roc_curve_png = out_dir / "roc_curve.png"
         plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
-    # ----- Save artifacts -----
+    # Compute standard metrics (post-threshold for binary if selected)
+    if getattr(args, "binary", False) and tuned_threshold is not None:
+        pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
+        y_pred = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
+        from sklearn.metrics import classification_report, confusion_matrix
+
+        report = classification_report(
+            (y_val == pos_idx).astype(int),
+            y_pred,
+            target_names=["safe", "not_safe"],
+            output_dict=True,
+        )
+        cm = confusion_matrix((y_val == pos_idx).astype(int), y_pred).tolist()
+        acc = (y_pred == (y_val == pos_idx).astype(int)).mean().item()
+    else:
+        y_pred = probs_val.argmax(axis=1)
+        report = classification_report(
+            y_val, y_pred, target_names=classes, output_dict=True
+        )
+        cm = confusion_matrix(y_val, y_pred).tolist()
+        acc = (y_pred == y_val).mean().item()
+
+    log.info("[✓] Final val_acc=%.4f", acc)
+
+    # ---- Save artifacts ----
     out_path = Path(args.out)
     out_dir = out_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save sklearn artifacts separately
+    # sklearn artifacts separately (for portability)
     joblib.dump(vect_word, out_dir / "vectorizer_word.joblib")
     if vect_char is not None:
         joblib.dump(vect_char, out_dir / "vectorizer_char.joblib")
     joblib.dump(le, out_dir / "label_encoder.joblib")
 
-    # Save torch bundle minimal (state only)
+    # best model state only
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -522,14 +609,22 @@ def run(args: argparse.Namespace) -> int:
         out_path,
     )
 
-    # Build metadata
+    # Save CM plot
+    plot_confusion_matrix(
+        cm,
+        classes if not getattr(args, "binary", False) else ["safe", "not_safe"],
+        out_dir / "confusion_matrix.png",
+    )
+
     metadata = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "scikit_learn_version": sklearn.__version__,
         "torch_version": torch.__version__,
         "cuda": getattr(torch.version, "cuda", None),
         "device": str(device),
-        "classes": classes,
+        "classes": classes
+        if not getattr(args, "binary", False)
+        else ["safe", "not_safe"],
         "class_distribution": class_counts,
         "accuracy": acc,
         "report": report,
@@ -541,25 +636,24 @@ def run(args: argparse.Namespace) -> int:
         "plots": {
             "pr_curve": str(pr_curve_png) if pr_curve_png else None,
             "roc_curve": str(roc_curve_png) if roc_curve_png else None,
+            "confusion_matrix": str(out_dir / "confusion_matrix.png"),
         },
+        "early_best_metric": best_metric,
     }
     with open(out_path.with_suffix(".metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    # Also save a compact text log of key metrics
     with open(out_dir / "summary.txt", "w", encoding="utf-8") as f:
         f.write(f"val_acc={acc:.4f}\n")
         if tuned_threshold is not None:
             f.write(f"tuned_threshold={tuned_threshold:.4f}\n")
         if T is not None:
             f.write(f"temperature={T:.4f}\n")
-
-    # Save confusion matrix plot
-    plot_confusion_matrix(cm, classes, out_dir / "confusion_matrix.png")
+        f.write(f"best_recallish={best_metric:.4f}\n")
 
     log.info("[✓] Saved model → %s", out_path)
     log.info("[✓] Saved metrics → %s", out_path.with_suffix(".metrics.json"))
-    log.info("[✓] Artifacts: %s", out_dir)
+    log.info("[✓] Artifacts dir: %s", out_dir)
     log.info("[✓] Done in %.1fs", time.time() - t0)
     return 0
 
