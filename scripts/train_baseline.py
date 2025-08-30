@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-PyTorch-powered TF-IDF + Logistic Regression training script.
-- Uses scikit-learn for TF-IDF feature extraction.
-- Uses PyTorch (with CUDA if available) for training logistic regression.
-- Saves model + metrics JSON.
+TF-IDF + (PyTorch) multinomial Logistic Regression
+- Sparse CSR -> dense per-sample on the fly (no giant toarray()).
+- Mini-batches, CUDA, mixed precision, class weights / weighted sampling.
+- Saves torch state_dict + sklearn artifacts + metrics JSON.
 """
 
 import argparse
@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,22 +23,24 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+log = logging.getLogger("train_baseline")
+
 
 # ------------------------- logging -------------------------
 def setup_logging(level: str = "INFO") -> None:
     level = level.upper()
-    if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
-        level = "INFO"
+    level = level if level in {"DEBUG", "INFO", "WARNING", "ERROR"} else "INFO"
     logging.basicConfig(
         level=getattr(logging, level),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
 
-log = logging.getLogger(__name__)
 
 # ------------------------- label normalization -------------------------
 CANON_LABELS = {
@@ -52,11 +54,13 @@ CANON_LABELS = {
     "fraud": "phishing",
 }
 
-def _canonicalize_label(x: str) -> str | None:
+
+def _canonicalize_label(x: str) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip().lower()
     return CANON_LABELS.get(s, s)
+
 
 # ------------------------- data loading -------------------------
 def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
@@ -77,6 +81,7 @@ def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
         df["label"] = df["label"].map(_canonicalize_label)
         df = df[["body_text", "label"]].copy()
         frames.append(df)
+
         try:
             sha256s.append(hashlib.sha256(pth.read_bytes()).hexdigest())
         except Exception:
@@ -99,7 +104,8 @@ def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
 
     return out, sha256s
 
-# ------------------------- PyTorch Model -------------------------
+
+# ------------------------- model -------------------------
 class TorchLogReg(nn.Module):
     def __init__(self, input_dim: int, num_classes: int):
         super().__init__()
@@ -108,31 +114,101 @@ class TorchLogReg(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-# ------------------------- main training -------------------------
+
+# ------------------------- dataset (CSR -> dense per item) -------------------------
+class CSRDataset(Dataset):
+    def __init__(self, X_csr, y_np: np.ndarray):
+        self.X = X_csr
+        self.y = y_np.astype(np.int64)
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        # Pull a single sparse row and convert to dense float32
+        row = self.X[idx]
+        # row is 1 x D; convert efficiently without building the whole matrix
+        x = torch.from_numpy(row.toarray().astype(np.float32, copy=False)).squeeze(0)
+        y = int(self.y[idx])
+        return x, y
+
+
+# ------------------------- training loop -------------------------
+def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
+    model.train()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    running_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (xb, yb) in enumerate(loader, 1):
+        xb = xb.to(device, non_blocking=True)
+        yb = torch.as_tensor(yb, device=device)
+
+        with torch.autocast(device_type="cuda", enabled=use_amp):
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss = loss / accum_steps
+
+        scaler.scale(loss).backward()
+
+        if step % accum_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        running_loss += loss.detach().item()
+
+    # flush remaining grads
+    if (step % accum_steps) != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+    return running_loss / max(1, len(loader))
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, classes: List[str]):
+    model.eval()
+    all_preds, all_true = [], []
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        logits = model(xb)
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+        all_preds.append(preds)
+        all_true.append(np.asarray(yb))
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_true)
+
+    acc = (y_pred == y_true).mean().item()
+    report = classification_report(
+        y_true, y_pred, target_names=classes, output_dict=True
+    )
+    cm = confusion_matrix(y_true, y_pred).tolist()
+    return acc, report, cm
+
+
+# ------------------------- main -------------------------
 def run(args: argparse.Namespace) -> int:
     setup_logging(args.log_level)
-    start_all = time.time()
+    t0 = time.time()
 
     log.info("[*] Loading data…")
     df, sha256s = load_concat(args.inputs)
     class_counts = df["label"].value_counts().to_dict()
-    log.info("    Total rows after cleaning: %d (class counts: %s)", len(df), class_counts)
+    log.info("Rows: %d | Class counts: %s", len(df), class_counts)
 
-    X = df["body_text"].values
+    X_text = df["body_text"].values
     le = LabelEncoder().fit(df["label"])
     y = le.transform(df["label"])
     classes = list(le.classes_)
 
-    # Split
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=args.val_size, random_state=args.seed, stratify=y
+    X_tr_text, X_te_text, y_tr, y_te = train_test_split(
+        X_text, y, test_size=args.val_size, random_state=args.seed, stratify=y
     )
 
-    # TF-IDF
-    log.info("[*] Building TF-IDF features (max_word=%d, max_char=%d)…",
-             args.max_features_word, args.max_features_char)
-
-    vectorizer = TfidfVectorizer(
+    log.info("[*] Building TF-IDF (max_features=%d)…", args.max_features_word)
+    vect = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
         max_features=args.max_features_word,
@@ -140,53 +216,110 @@ def run(args: argparse.Namespace) -> int:
         stop_words="english",
         dtype=np.float32,
     )
-    X_tr_tfidf = vectorizer.fit_transform(X_tr)
-    X_te_tfidf = vectorizer.transform(X_te)
+    X_tr = vect.fit_transform(X_tr_text)  # CSR
+    X_te = vect.transform(X_te_text)
 
-    # Torch tensors
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"[*] Using device: {device}")
+    pin = device.type == "cuda"
+    log.info("Device: %s | AMP: %s | pin_memory: %s", device, args.mixed_precision, pin)
 
-    X_train = torch.tensor(X_tr_tfidf.toarray(), dtype=torch.float32).to(device)
-    y_train = torch.tensor(y_tr, dtype=torch.long).to(device)
-    X_test = torch.tensor(X_te_tfidf.toarray(), dtype=torch.float32).to(device)
-    y_test = torch.tensor(y_te, dtype=torch.long).to(device)
+    # Dataset / Loader
+    ds_tr = CSRDataset(X_tr, y_tr)
+    ds_te = CSRDataset(X_te, y_te)
+
+    # Optional weighted sampling (helps on imbalance)
+    if args.weighted_sampler:
+        class_sample_count = np.bincount(y_tr, minlength=len(classes))
+        weights = 1.0 / np.clip(class_sample_count, 1, None)
+        sample_weights = weights[y_tr]
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_weights).double(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=pin,
+            persistent_workers=False,
+        )
+    else:
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin,
+            persistent_workers=False,
+        )
+
+    te_loader = DataLoader(
+        ds_te,
+        batch_size=max(256, args.batch_size),
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        persistent_workers=False,
+    )
 
     # Model
-    model = TorchLogReg(X_train.shape[1], len(classes)).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    input_dim = X_tr.shape[1]
+    model = TorchLogReg(input_dim, len(classes)).to(device)
 
-    # Training
-    log.info("[*] Training model…")
+    # Class weights for CE (another way to handle imbalance)
+    weight_t = None
+    if args.class_weight == "balanced":
+        binc = np.bincount(y_tr, minlength=len(classes)).astype(np.float32)
+        w = (len(y_tr) / np.clip(binc, 1, None)) / len(classes)
+        weight_t = torch.tensor(w, device=device, dtype=torch.float32)
+        log.info("Class weights: %s", w.tolist())
+
+    criterion = nn.CrossEntropyLoss(weight=weight_t)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+
+    log.info(
+        "[*] Training… (epochs=%d, batch_size=%d, accum=%d)",
+        args.epochs,
+        args.batch_size,
+        args.accum_steps,
+    )
     for epoch in range(1, args.epochs + 1):
-        optimizer.zero_grad()
-        outputs = model(X_train)
-        loss = criterion(outputs, y_train)
-        loss.backward()
-        optimizer.step()
+        loss = train_epoch(
+            model,
+            tr_loader,
+            optimizer,
+            criterion,
+            device,
+            args.mixed_precision,
+            args.accum_steps,
+        )
+        acc, _, _ = evaluate(model, te_loader, device, classes)
+        log.info(
+            "Epoch %d/%d | loss=%.5f | val_acc=%.4f", epoch, args.epochs, loss, acc
+        )
 
-        if epoch % 1 == 0:
-            log.info(f"Epoch {epoch}/{args.epochs}, Loss: {loss.item():.4f}")
+    acc, report, cm = evaluate(model, te_loader, device, classes)
+    log.info("[✓] Final val_acc=%.4f", acc)
 
-    # Evaluation
-    with torch.no_grad():
-        preds = torch.argmax(model(X_test), dim=1)
-        acc = (preds == y_test).float().mean().item()
-        log.info(f"[✓] Accuracy: {acc:.4f}")
-        report = classification_report(y_test.cpu(), preds.cpu(), target_names=classes, output_dict=True)
-        cm = confusion_matrix(y_test.cpu(), preds.cpu()).tolist()
-
-    # Save model + metadata
+    # Save bundle
     out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     bundle = {
         "model_state": model.state_dict(),
-        "vectorizer": vectorizer,
-        "label_encoder": le,
+        "input_dim": input_dim,
+        "num_classes": len(classes),
+        "vectorizer": vect,  # pickled inside torch.save
+        "label_encoder": le,  # pickled
         "metadata": {
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "scikit_learn_version": sklearn.__version__,
             "torch_version": torch.__version__,
+            "cuda": getattr(torch.version, "cuda", None),
+            "device": str(device),
             "classes": classes,
             "class_distribution": class_counts,
             "accuracy": acc,
@@ -195,38 +328,65 @@ def run(args: argparse.Namespace) -> int:
             "params": vars(args),
         },
     }
-
     torch.save(bundle, out_path)
-    metrics_json = out_path.with_suffix(".metrics.json")
-    with open(metrics_json, "w", encoding="utf-8") as f:
+    with open(out_path.with_suffix(".metrics.json"), "w", encoding="utf-8") as f:
         json.dump(bundle["metadata"], f, indent=2)
 
-    log.info(f"[✓] Saved model → {out_path}")
-    log.info(f"[✓] Saved metrics → {metrics_json}")
-    log.info("[✓] Done in %.1fs", time.time() - start_all)
+    log.info("[✓] Saved model → %s", out_path)
+    log.info("[✓] Saved metrics → %s", out_path.with_suffix(".metrics.json"))
+    log.info("[✓] Done in %.1fs", time.time() - t0)
     return 0
+
 
 # ------------------------- CLI -------------------------
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--inputs", nargs="+", required=True, help="CSV paths")
+    ap.add_argument(
+        "--inputs",
+        nargs="+",
+        required=True,
+        help="CSV paths with columns: body_text,label",
+    )
     ap.add_argument("--val-size", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--max-features-word", type=int, default=10000)
-    ap.add_argument("--max-features-char", type=int, default=2000)  # not used yet, but kept
-    ap.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    ap.add_argument("--out", required=True, help="Output model path (e.g., models/tfidf_lr_torch.pt)")
-    ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR (default: INFO)")
+    ap.add_argument("--max-features-word", type=int, default=20000)
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument(
+        "--accum-steps", type=int, default=1, help="Gradient accumulation steps"
+    )
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--class-weight", choices=["none", "balanced"], default="balanced")
+    ap.add_argument(
+        "--weighted-sampler",
+        action="store_true",
+        help="Enable WeightedRandomSampler on train loader",
+    )
+    ap.add_argument("--mixed-precision", dest="mixed_precision", action="store_true")
+    ap.add_argument(
+        "--no-mixed-precision", dest="mixed_precision", action="store_false"
+    )
+    ap.set_defaults(mixed_precision=True)
+    ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument(
+        "--out", required=True, help="Output .pt path (e.g., models/tfidf_lr_torch.pt)"
+    )
+    ap.add_argument("--log-level", default="INFO")
     return ap.parse_args()
 
-def main() -> None:
+
+def main():
     try:
         args = parse_args()
-        code = run(args)
-        sys.exit(code)
+        setup_logging(args.log_level)
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        sys.exit(run(args))
     except Exception as e:
-        log.error("Uncaught error: %s", e)
+        log.exception("Uncaught error: %s", e)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
