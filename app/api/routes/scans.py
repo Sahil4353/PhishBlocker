@@ -3,15 +3,17 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
-from typing import Generator, Literal, Optional
+from typing import Any, Dict, Generator, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
 from app.db import SessionLocal
 from app.models.scan import Scan
+from app.services.scan_pipeline import create_scan_from_text  # ⬅️ pipeline
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["api"])  # groups these under "api" in Swagger
@@ -39,7 +41,95 @@ def get_db() -> Generator[Session, None, None]:
 
 
 # -----------------------------------------------------------------------------
-# GET /scan/{scan_id} — lightweight JSON detail (template is in pages.py)
+# Schemas
+# -----------------------------------------------------------------------------
+class ScanCreate(BaseModel):
+    text: str = Field(min_length=1)
+    subject: Optional[str] = None
+    sender: Optional[str] = None
+
+
+def _scan_to_payload(s: Scan) -> Dict[str, Any]:
+    return {
+        "id": s.id,
+        "created_at": s.created_at.isoformat()
+        if getattr(s, "created_at", None)
+        else None,
+        "subject": s.subject,
+        "sender": s.sender,
+        "label": s.label,
+        "confidence": float(s.confidence) if s.confidence is not None else None,
+        "reasons": (s.reasons or "").split(", ") if s.reasons else [],
+        "body_preview": s.body_preview,
+    }
+
+
+# -----------------------------------------------------------------------------
+# NEW: POST /api/scan — create a scan from raw text (JSON)
+# -----------------------------------------------------------------------------
+@router.post("/api/scan")
+def create_scan_api(
+    payload: ScanCreate, request: Request, db: Session = Depends(get_db)
+):
+    try:
+        model = getattr(request.app.state, "model", None)
+        scan: Scan = create_scan_from_text(
+            db=db,
+            text=payload.text.strip(),
+            subject=payload.subject,
+            sender=payload.sender,
+            model=model,
+        )
+        logger.info("api created scan id=%s label=%s", scan.id, scan.label)
+        return JSONResponse(_scan_to_payload(scan), status_code=status.HTTP_201_CREATED)
+    except Exception as e:
+        logger.exception("create_scan_api failed: %s", e)
+        return JSONResponse(
+            {"error": "Internal Server Error", "message": "Failed to scan text."},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+# -----------------------------------------------------------------------------
+# NEW: GET /api/scans — paginated list
+# -----------------------------------------------------------------------------
+@router.get("/api/scans")
+def list_scans(
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+):
+    try:
+        total = db.query(Scan).count()
+        page = max(1, page)
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+
+        rows: List[Scan] = (
+            db.query(Scan)
+            .order_by(Scan.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        items = [_scan_to_payload(s) for s in rows]
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "pages": pages,
+            "page_size": page_size,
+        }
+    except Exception as e:
+        logger.exception("list_scans failed: %s", e)
+        return JSONResponse(
+            {"error": "Internal Server Error", "message": "Failed to list scans."},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+# -----------------------------------------------------------------------------
+# GET /scan/{scan_id} — lightweight JSON detail (template version is in pages.py)
 # -----------------------------------------------------------------------------
 @router.get("/scan/{scan_id}")
 def scan_detail(scan_id: int, db: Session = Depends(get_db)):
@@ -49,23 +139,8 @@ def scan_detail(scan_id: int, db: Session = Depends(get_db)):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found"
             )
-
-        payload = {
-            "id": scan.id,
-            "created_at": scan.created_at.isoformat()
-            if getattr(scan, "created_at", None)
-            else None,
-            "subject": scan.subject,
-            "sender": scan.sender,
-            "label": scan.label,
-            "confidence": float(scan.confidence)
-            if scan.confidence is not None
-            else None,
-            "reasons": (scan.reasons or "").split(", ") if scan.reasons else [],
-            "body_preview": scan.body_preview,
-        }
         logger.info("served scan detail scan_id=%s label=%s", scan_id, scan.label)
-        return JSONResponse(payload)
+        return JSONResponse(_scan_to_payload(scan))
 
     except HTTPException:
         raise
@@ -110,7 +185,6 @@ def export_csv(
         if end_dt and hasattr(Scan, "created_at"):
             q = q.filter(Scan.created_at <= end_dt)
 
-        # Build CSV in-memory (ok for small/medium exports).
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(
@@ -119,22 +193,19 @@ def export_csv(
 
         rows = q.order_by(Scan.id.desc()).all()
         for s in rows:
-            safe_subject = _excel_safe(s.subject or "")
-            safe_sender = _excel_safe(s.sender or "")
             created = s.created_at.isoformat() if getattr(s, "created_at", None) else ""
             writer.writerow(
                 [
                     s.id,
                     created,
-                    safe_subject,
-                    safe_sender,
+                    _excel_safe(s.subject or ""),
+                    _excel_safe(s.sender or ""),
                     s.label,
                     s.confidence,
                     s.reasons or "",
                 ]
             )
 
-        # Reset buffer and stream the whole content (simple approach)
         csv_bytes = buf.getvalue()
         logger.info(
             "csv export complete count=%s label=%s date_from=%s date_to=%s",
@@ -150,7 +221,6 @@ def export_csv(
         )
 
     except ValueError as ve:
-        # e.g., bad date format
         logger.warning("csv export validation error: %s", ve)
         return PlainTextResponse(str(ve), status_code=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
@@ -165,9 +235,7 @@ def export_csv(
 # Helpers
 # -----------------------------------------------------------------------------
 def _excel_safe(val: str) -> str:
-    """
-    Guard against Excel/Sheets formula injection by prefixing risky leading chars.
-    """
+    """Guard against Excel/Sheets formula injection by prefixing risky leading chars."""
     return f"'{val}" if val[:1] in ("=", "+", "-", "@") else val
 
 
