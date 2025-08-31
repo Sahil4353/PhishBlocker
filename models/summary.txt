@@ -1,0 +1,4 @@
+val_acc=0.9953
+tuned_threshold=0.2582
+temperature=0.8423
+best_recallish=0.9865
