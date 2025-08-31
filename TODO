@@ -1,10 +1,12 @@
-awesome—here’s your **updated status snapshot** with the ML work you just landed, plus a clear view of branches and some practical git hygiene for next steps.
+Got it 🚀 — here’s your **refreshed project status snapshot**, updated to reflect all the ML, Git hygiene, and dataset handling work we’ve done over the last sprint.
 
-# PhishBlocker — Status Snapshot (updated)
+---
+
+# PhishBlocker — Status Snapshot (latest)
 
 ## What’s done ✅
 
-### App / APIs / Infra (unchanged from last snapshot)
+### App / APIs / Infra
 
 * **FastAPI app** with app-factory + lifespan and request-ID middleware.
 * **Routers**
@@ -14,187 +16,163 @@ awesome—here’s your **updated status snapshot** with the ML work you just la
   * **debug:** `/health`, `/_debug/scan_count`, `/_debug/cwd`
 * **Logging & config:** env-driven logging; request-ID on all log lines; `uvicorn.*` filters.
 * **Database & migrations:** `Email` + `Scan` with FK and indexes; SQLite tuned (FK ON, WAL, etc.); Alembic wired.
-* **Batch ingestion:** `scripts/ingest_enron.py` → `data/processed/enron_parsed.csv`.
-* **Services (present, unchanged):** `parser.py`, `heuristics.py`, `scan_pipeline.py`.
+* **Batch ingestion:** `scripts/ingest_enron.py` → `data/processed/enron_parsed.csv` (local only).
+* **Services:** `parser.py`, `heuristics.py`, `scan_pipeline.py`.
 * **Pages/UI:** history, detail, CSV export (safe vs Excel formulas).
 * **DB access:** shared `get_db()` in `app/db.py`.
 
-### New: ML baseline & data prep
+### New: ML baseline, trainer & data hygiene
 
-* **Training script**: `scripts/train_baseline.py`
+* **Robust trainer (`scripts/train_baseline.py`)**
 
-  * TF-IDF **word(1–2)** + **char(3–5)**, `min_df=3`, English stop-words, `float32`, feature caps.
-  * **Logistic Regression (default):** SAGA, elastic-net (`l1_ratio=0.05`), `C=0.5`, `max_iter=5000`, `class_weight="balanced"`, seeded.
-  * **Optional `--ensemble`** (not used in app yet): LR + MultinomialNB + calibrated LinearSVM (Platt/sigmoid, `cv=3`) with soft-voting.
-  * Safe probability handling, confusion matrix & per-class PR plots, rich `*.metrics.json`.
-* **Smoke predictor**: `scripts/predict.py` (prints label, per-class probs, and LR token “reasons”).
-* **Public datasets (processed in-repo)**
+  * Resilient I/O: CSV/Parquet support, pyarrow fast-path, python-engine fallback with chunked loading & `on_bad_lines="skip"`.
+  * Canonical label mapping, strict schema validation, clean drop of empties/unknowns.
+  * **LR options:**
 
-  * `scripts/prepare_spamassassin.py` → `data/processed/spamassassin_parsed.csv` (**4,669** rows).
-  * `scripts/prepare_nazario.py` → `data/processed/nazario_phishing.csv` (**1,565** rows).
-  * (You also trained once on a **mix**; see results below.)
-* **Artifacts (latest LR run)**
+    * Default: SAGA + elastic-net (`l1_ratio=0.05`, `C=0.5`, `max_iter=5000`).
+    * `--fast-l2`: LBFGS + L2 penalty (faster, recommended for large data).
+    * Exposed `--C` and `--max-iter`.
+    * Optional soft-voting **ensemble** (`LR + NB + calibrated LinearSVM`).
+  * Structured logging: env info, splits, training timings, convergence warnings, host & PID in metadata.
+  * Rich artifacts: `*.joblib` (pipeline + encoder + metadata), `*.metrics.json`, confusion matrix & PR plots.
+  * Threshold suggestions: best-F1, prec\@95, prec\@98.
+  * Exit codes: `0=ok, 2=save error, 130=interrupt, 1=unexpected`.
 
-  * Trained on: `enron_parsed.csv` + SpamAssassin + Nazario (or the smaller *mix* run).
-  * Example artifacts:
+* **Predictor (`scripts/predict.py`)**
 
-    * `models/tfidf_lr_fast.joblib`
-    * `models/tfidf_lr_fast.metrics.json`
-    * `models/tfidf_lr_fast.cm.png`, `models/tfidf_lr_fast.pr.phishing.png`
-* **Results (on the \~156k “mix” run)**
+  * Prints label, per-class probs, and top LR token reasons.
+
+* **Public datasets (local-only, ignored by git)**
+
+  * SpamAssassin (\~4.6k rows)
+  * Nazario (\~1.5k rows)
+  * Enron (\~3.1M rows, parquet preferred)
+  * Mix-balanced dataset script added.
+
+* **Artifacts (latest balanced LR run)**
 
   * Classes: `['phishing', 'safe', 'spam']`
-  * Macro-F1 ≈ **0.723**
+  * Macro-F1 = **0.957**
+  * Phishing: P≈0.98 @ R≈0.96 (τ≈0.72)
+  * Spam: P≈0.95 @ R≈0.93 (τ≈0.91)
+  * NB baseline also runs in seconds (Macro-F1≈0.899) and serves as a fast fallback.
 
-    * phishing: P=0.487, **R=0.994**, F1=0.653
-    * safe: **P=1.000**, R=0.968, F1=0.984
-    * spam: P=0.363, **R=0.995**, F1=0.532
-  * Takeaway: current LR is **recall-oriented** on minority classes (great for catching bad mail), but **precision is low** for phishing/spam on this split. That’s expected with heavy class imbalance; we’ll tune thresholds and data balance next.
+* **Data hygiene**
 
-> ⚠️ **Services**: unchanged on purpose. Keep using the LR artifact with the CLI for now. Don’t plug an ensemble artifact into the current service until we add the tiny “use LR’s coefficients for reasons even when ensemble predicts” shim.
+  * `.gitignore` tightened — ignores all `data/**/*.csv|parquet` and `models/**` artifacts (keeps `.gitkeep` + README).
+  * Added `data/README.md`: documents local-only policy, dataset structure, and CSV→Parquet conversion recipe.
+  * Large CSVs purged from git history with `git filter-repo`.
+  * Branch pushed cleanly; history free of >100MB files.
 
 ---
 
-## Branches & commits
+## Branches & workflow
 
-### Current branch structure
-
-* **develop** — upstream base (not the branch you’re working from).
+* **develop** — upstream base.
 * **feat/services-pipeline** — app services (parser/heuristics/pipeline).
-* **feat/ml/baseline-v2** — *your active ML branch* (branched from `feat/services-pipeline`, tracking `origin/feat/ml/baseline-v2`).
+* **feat/ml/robust-v1** — 🚀 active ML branch (trainer, predictor, data hygiene).
 * **feat/data-enron-ingest** — ingestion + schema foundations.
 
-### Suggested day-to-day flows
+**Flow:**
 
-* Keep ML isolated:
-
-  ```powershell
-  # keep your branch current with services-pipeline (no merge commits)
-  git fetch origin
-  git rebase origin/feat/services-pipeline
-  # resolve, test, then push
-  git push --force-with-lease
-  ```
-* When services work is merged to `develop`, **rebase ML onto `develop`** once, then open a PR from `feat/ml/baseline-v2` → `develop`.
+* ML work stays isolated on `feat/ml/robust-v1`.
+* Rebase regularly onto `feat/services-pipeline`.
+* Once `services-pipeline` → `develop`, rebase `robust-v1` onto `develop` and open PR.
 
 ---
 
-## What changed since the last snapshot 🔄
+## What changed since last snapshot 🔄
 
-* Added full **ML baseline** (trainer, predictor, metrics & plots, thresholds in JSON).
-* Added **public data prep** scripts + processed corpora.
-* Trained first **LR model** with measurable metrics; CLI **reasons** working.
-* Implemented optional **ensemble flag** (kept off in app; CLI only).
-* No changes to `app/services` yet (by design).
+* Replaced fragile CSV reads with **resilient loader** (pyarrow + chunked fallback).
+* Added **fast L2/LBFGS option** (`--fast-l2`) for LR.
+* Full **robust logging & error handling** across training.
+* Added **data/README.md**, tightened `.gitignore`, purged large blobs from git history.
+* NB baseline + LR small run trained and evaluated — LR achieved Macro-F1=0.957 on balanced mix.
+* Repo successfully pushed to GitHub after history cleanup.
 
 ---
 
 ## Smoke checklist (now)
 
-* Train (fast footprint)
+```powershell
+# Train fast baseline on balanced mix
+python scripts\train_baseline.py `
+  --inputs data\processed\mix_balanced.parquet `
+  --val-size 0.2 --seed 42 `
+  --fast-l2 --max-features-word 60000 --max-features-char 40000 `
+  --out models\tfidf_lr_small_l2.joblib
 
-  ```powershell
-  python scripts\train_baseline.py `
-    --inputs data\processed\mix_balanced.csv `
-    --val-size 0.2 --seed 42 `
-    --max-features-word 80000 --max-features-char 80000 `
-    --out models\tfidf_lr_fast.joblib
-  ```
-* Predict (CLI)
+# Predict
+python scripts\predict.py --model models\tfidf_lr_small_l2.joblib `
+  "verify your account urgently to continue" `
+  "free gift voucher click here" `
+  "team lunch next Thursday at 12"
 
-  ```powershell
-  python scripts\predict.py --model models\tfidf_lr_fast.joblib `
-    "verify your account urgently to continue" `
-    "free gift voucher click here" `
-    "team lunch next Thursday at 12"
-  ```
-* Inspect metrics & threshold suggestions
-
-  ```powershell
-  python - << 'PY'
-  ```
-
-import json, pprint
-m="models/tfidf\_lr\_fast.metrics.json"
-pp=json.load(open(m,encoding="utf-8"))
-print("Macro-F1:", round(pp\["metrics"]\["macro avg"]\["f1-score"],3))
-print("Threshold suggestions:"); pprint.pp(pp.get("threshold\_suggestions",{}))
+# Inspect metrics JSON
+python - << 'PY'
+import json; meta=json.load(open("models/tfidf_lr_small_l2.metrics.json"))
+print("Macro-F1:", round(meta["metrics"]["macro avg"]["f1-score"],3))
+print("Thresholds:", meta["threshold_suggestions"])
 PY
-
 ```
 
 ---
 
 ## Roadmap (updated)
 
-### M1 — MVP polish (Local) · **in progress**
-- [ ] Wire `pages.py` `POST /scan` to `create_scan_from_text(...)` (persist Email+Scan consistently).
-- [ ] Add `/api/scan (POST)` + `/api/scans (GET)`.
-- [ ] Use **LR artifact** only (no ensemble) in the first wiring.
+### M1 — MVP polish (Local) · **nearly done**
 
-### M2 — Data & thresholds · **next**
-- [ ] Increase minority examples (add modern phishing corpora; de-dup; basic cleaning).
-- [ ] Downsample safe or up-weight hard negatives; evaluate.
-- [ ] Adopt **threshold_suggestions** from metrics JSON for UI defaults (e.g., quarantine if P(phishing) ≥ T\_98P).
+* [ ] Wire `POST /scan` to ML pipeline (`predict_with_explanations`).
+* [ ] Add `/api/scan (POST)` + `/api/scans (GET)`.
+* [ ] Use LR artifact + thresholds JSON.
 
-### M3 — Services integration (ML) · **after M1/M2**
-- [ ] Add `app/services/model.py` (or extend existing) to load joblib once and expose:
-`predict_with_explanations(text) -> (label, prob, reasons)`.
-- [ ] If classifier is an ensemble, pull LR sub-estimator coefficients for “reasons”.
-- [ ] Make thresholds configurable via env or DB.
+### M2 — Data & thresholds
+
+* [ ] Augment phishing corpora, de-dup & clean.
+* [ ] Downsample safe / up-weight spam+phishing.
+* [ ] Adopt thresholds from metrics JSON into UI defaults.
+
+### M3 — Services integration (ML)
+
+* [ ] Add `app/services/model.py` loader (joblib + thresholds).
+* [ ] Integrate into `scan_pipeline.py`.
+* [ ] If ensemble, pull LR coefficients for explanations.
 
 ### M4 — Feedback & filters
-- [ ] Feedback table + “Correct label” UI.
-- [ ] History filters: label/date/sender search.
+
+* [ ] Add feedback UI for corrected labels.
+* [ ] History filters: label/date/sender.
 
 ### M5 — CI & packaging
-- [ ] Pre-commit, pytest, GitHub Actions (lint/test/build).
-- [ ] Docker image; Alembic on startup.
+
+* [ ] Pre-commit hooks (black, ruff, isort).
+* [ ] Basic pytest suite.
+* [ ] GitHub Actions workflow (lint/test/build).
+* [ ] Docker image; Alembic migrations on startup.
 
 ### M6 — Safety & retention
-- [ ] TTL for raw bodies; purge jobs; security headers; rate limiting.
+
+* [ ] TTL for raw email bodies, purge jobs.
+* [ ] Security headers & rate limiting.
 
 ---
 
-## Git recommendations (future-proofing)
+## Git hygiene
 
-**Branching**
-- Keep features on short-lived branches: `feat/<area>-<slug>`.
-- Rebase feature branches onto the target (no long-running diverged histories).
-- Prefer **squash & merge** for clean history.
-
-**PRs**
-- Small, single-purpose PRs (≤ 400 lines diff ideally).
-- Template with: What/Why/How/Test plan/Risks.
-- CODEOWNERS for app vs. ML reviewers.
-
-**Versioning & artifacts**
-- Don’t commit data or model binaries. Keep `data/**` and `models/**` in `.gitignore`.
-- Tag code-only releases, not model files:  
-`git tag ml/v2-<yyyy-mm-dd>` on commit that produced the artifact.
-- Store artifacts in a bucket or release storage, and record the path/URI in `*.metrics.json` (we already save metadata; we can add an `artifact_uri` later).
-
-**.gitignore / large files**
-- Ensure `.db`, `*.joblib`, `*.png`, `*.json` under `models/`, and `data/raw|processed/` are ignored (looks good already).
-
-**Quality gates**
-- Add `pre-commit` (black, ruff, isort), basic `pytest -q`, and mypy (optional) before merging to `develop`.
+* **Artifacts & datasets ignored.**
+* **Clean history:** big CSVs removed with `git filter-repo`.
+* **Branching:** `feat/<area>-<slug>`; short-lived, rebased often.
+* **PRs:** small, single-purpose; squash & merge into `develop`.
+* **Tags:** code-only tags (`ml/v2-<date>`); artifacts tracked in JSON metadata.
 
 ---
 
-## Immediate next steps (pick one)
+✅ Project is now at a strong **baseline ML milestone**:
 
-**A) Wire LR into the app (small PR)**
-- Add `app/services/model.py` (loader + `predict_with_explanations` using LR).
-- In `scan_pipeline.py`, optionally call the model; store `label`, `confidence`, and “reasons”.
-- Update `POST /scan` to use pipeline.
+* Training pipeline is robust and reproducible.
+* Balanced LR baseline exceeds KPI (≥95% precision @ ≥85% recall).
+* Repo is cleaned and ready for PR into `develop`.
 
-**B) Improve data balance**
-- Create a balanced training set (downsample safe, or stratified cap per class), retrain LR, compare Macro-F1 & phishing precision.
+---
 
-**C) Evaluate ensemble (offline)**
-- Train with `--ensemble`, compare phishing PR-AUC & Macro-F1. If it wins without latency pain, we’ll add the explanation shim and consider promoting it.
-
-Tell me which track you want to execute right now, and I’ll drop the exact diff/patch (tiny, focused) to get it done.
-::contentReference[oaicite:0]{index=0}
-```
+👉 Do you want me to draft the **tiny `app/services/model.py` loader** next, so you can wire the LR artifact into `/scan` and close out M1?

@@ -43,3 +43,5 @@ Thumbs.db
 models/*.png
 models/*.json
 phishblocker.db*
+models/*.pt
+models/cache/
