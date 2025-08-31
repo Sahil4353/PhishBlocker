@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, load_only
 from app.core.logging import get_logger
 from app.db import SessionLocal
 from app.models.scan import Scan
-from app.services.heuristics import classify_text
+from app.services.scan_pipeline import create_scan_from_text  # ⬅️ use pipeline
 
 logger = get_logger(__name__)
 templates = Jinja2Templates(directory="app/templates")
@@ -72,48 +72,46 @@ def scan_email(
     sender: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    """Accept pasted/raw email content, classify, persist, then redirect (PRG)."""
+    """
+    Accept pasted/raw email content, classify via pipeline, persist Email+Scan,
+    then redirect (PRG) to the detail page.
+    """
     try:
         raw_text = (raw or "").strip()
+        if not raw_text:
+            return HTMLResponse(
+                "<h1>Bad Request</h1><p>Empty message body.</p>",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
 
-        label, confidence, reasons = classify_text(raw_text)
-        logger.info("classified email label=%s conf=%.3f", label, confidence)
+        # Pull model from app.state if available; pipeline should gracefully
+        # fallback to heuristics when model is None.
+        model = getattr(request.app.state, "model", None)
 
-        record = Scan(
+        # Pipeline does:
+        #  - persist Email
+        #  - run ML/heuristics
+        #  - persist Scan
+        #  - return persisted Scan row
+        scan: Scan = create_scan_from_text(
+            db=db,
+            text=raw_text,
             subject=subject,
             sender=sender,
-            raw=raw_text,
-            body_preview=raw_text[:MAX_BODY_PREVIEW_LEN],
-            label=label,
-            confidence=confidence,
-            reasons=", ".join(reasons),
+            model=model,
+            body_preview_len=MAX_BODY_PREVIEW_LEN,
         )
 
-        try:
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-        except Exception as db_err:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            logger.exception("DB commit failed while saving Scan record: %s", db_err)
-            # On error we still render a page so the user sees the message.
-            return templates.TemplateResponse(
-                "result.html",
-                {
-                    "request": request,
-                    "label": "error",
-                    "confidence": 0.0,
-                    "reasons": ["database error while saving scan"],
-                },
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        logger.info(
+            "pipeline created scan id=%s label=%s conf=%.3f",
+            scan.id,
+            scan.label,
+            float(scan.confidence) if scan.confidence is not None else -1.0,
+        )
 
         # PRG: 303 See Other -> always follow with GET to the detail page
         detail_url = request.url_for(
-            "scan_detail_view", scan_id=record.id
+            "scan_detail_view", scan_id=scan.id
         ).include_query_params(ok="1")
         return RedirectResponse(url=str(detail_url), status_code=303)
 
