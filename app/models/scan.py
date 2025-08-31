@@ -51,17 +51,26 @@ class Scan(Base):
     # Classification result
     label: Mapped[str] = mapped_column(
         String(32), nullable=False, default="safe"
-    )  # safe|spam|phishing
+    )  # safe|spam|phishing (or not_safe in binary)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
     reasons: Mapped[str | None] = mapped_column(
         Text, nullable=True
-    )  # JSON/text of top indicators
+    )  # human-readable summary (e.g., "verify, account, click")
     header_flags: Mapped[dict | list | None] = mapped_column(
         JSON, nullable=True
     )  # heuristics booleans, etc.
+
+    # NEW: structured model outputs
+    probs: Mapped[dict | list | None] = mapped_column(
+        JSON, nullable=True
+    )  # full probability map (e.g., {"safe":0.98,"spam":0.01,"phishing":0.01})
+    details: Mapped[dict | list | None] = mapped_column(
+        JSON, nullable=True
+    )  # temperature, threshold, feature attributions, etc.
+
     model_version: Mapped[str | None] = mapped_column(
         String(64), nullable=True
-    )  # e.g., 2025-08-24.tfidf_lr.v1
+    )  # e.g., 2025-08-30.tfidf_lr_torch.v1
     direction: Mapped[str | None] = mapped_column(
         String(16), nullable=True
     )  # inbox|sent|upload
