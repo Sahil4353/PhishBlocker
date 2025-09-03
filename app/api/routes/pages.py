@@ -1,3 +1,4 @@
+# app/api/routes/pages.py
 from __future__ import annotations
 
 from math import ceil
@@ -88,18 +89,13 @@ def scan_email(
         # fallback to heuristics when model is None.
         model = getattr(request.app.state, "model", None)
 
-        # Pipeline does:
-        #  - persist Email
-        #  - run ML/heuristics
-        #  - persist Scan
-        #  - return persisted Scan row
+        # Pipeline persists Email + Scan and returns the Scan row
         scan: Scan = create_scan_from_text(
             db=db,
-            text=raw_text,
-            subject=subject,
-            sender=sender,
+            body_text=raw_text,
+            subject=(subject or "").strip() or None,
+            sender=(sender or "").strip() or None,
             model=model,
-            body_preview_len=MAX_BODY_PREVIEW_LEN,
         )
 
         logger.info(
@@ -200,6 +196,24 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
                 status_code=status.HTTP_404_NOT_FOUND,
             )
 
+        # Prefer legacy reasons string, else try details_json.reasons (if present)
+        reasons_list = (scan.reasons or "").split(", ") if scan.reasons else []
+        if not reasons_list and hasattr(scan, "details_json") and scan.details_json:
+            try:
+                r = scan.details_json.get("reasons")
+                if isinstance(r, list):
+                    # list of {"token": "..."} or list[str]
+                    tokens = []
+                    for it in r:
+                        if isinstance(it, dict) and "token" in it:
+                            tokens.append(str(it["token"]))
+                        elif isinstance(it, str):
+                            tokens.append(it)
+                    if tokens:
+                        reasons_list = tokens[:8]
+            except Exception:
+                pass
+
         payload = {
             "id": scan.id,
             "created_at": (
@@ -213,7 +227,7 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
             "confidence": float(scan.confidence)
             if scan.confidence is not None
             else None,
-            "reasons": (scan.reasons or "").split(", ") if scan.reasons else [],
+            "reasons": reasons_list,
             "body_preview": scan.body_preview,
         }
 
