@@ -2,23 +2,47 @@
 {% macro label_chip(label) -%}
 {% set l = (label or '')|lower %}
 {% if l == 'phishing' %}
-<span
-    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #fecaca;background:#fde8e8;color:#b91c1c;white-space:nowrap;">
+<span style="padding:0.2rem 0.6rem;
+         border-radius:999px;
+         font-size:0.85rem;
+         font-weight:600;
+         color:#b91c1c;
+         background:#fde8e8;
+         border:1px solid #fecaca;
+         white-space:nowrap;">
     Phishing
 </span>
 {% elif l == 'spam' %}
-<span
-    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #fef08a;background:#fef9c3;color:#854d0e;white-space:nowrap;">
+<span style="padding:0.2rem 0.6rem;
+         border-radius:999px;
+         font-size:0.85rem;
+         font-weight:600;
+         color:#854d0e;
+         background:#fff7e6;
+         border:1px solid #fed7aa;
+         white-space:nowrap;">
     Spam
 </span>
 {% elif l == 'safe' %}
-<span
-    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #bbf7d0;background:#ecfdf5;color:#065f46;white-space:nowrap;">
+<span style="padding:0.2rem 0.6rem;
+         border-radius:999px;
+         font-size:0.85rem;
+         font-weight:600;
+         color:#065f46;
+         background:#ecfdf5;
+         border:1px solid #bbf7d0;
+         white-space:nowrap;">
     Safe
 </span>
 {% else %}
-<span
-    style="padding:0.15rem 0.5rem;border-radius:999px;border:1px solid #e5e7eb;background:#f9fafb;color:#374151;white-space:nowrap;">
+<span style="padding:0.2rem 0.6rem;
+         border-radius:999px;
+         font-size:0.85rem;
+         font-weight:600;
+         color:#374151;
+         background:#f9fafb;
+         border:1px solid #e5e7eb;
+         white-space:nowrap;">
     {{ label or 'Unknown' }}
 </span>
 {% endif %}
