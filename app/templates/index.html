@@ -1,12 +1,12 @@
 {% extends 'base.html' %}
 {% block content %}
 <h2>Quick Scan</h2>
-<p class="muted">Paste the email content below. We’ll run a quick heuristic check (regex-based) and store the result.
+<p class="muted">
+  Paste the email content below. We’ll analyse it with our ML model (with heuristic fallbacks) and store the result.
 </p>
 <div class="space"></div>
 
-<form method="post" action="{{ request.url_for('scan_email') }}">
-  <!-- Optional: this will be ignored until you wire CSRF in the backend -->
+<form id="scan-form" method="post" action="{{ request.url_for('scan_email') }}">
   {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
 
   <label>Subject <span class="muted">(optional)</span></label>
@@ -16,11 +16,39 @@
   <input type="email" name="sender" placeholder="sender@example.com" />
 
   <label>Raw Email</label>
-  <textarea name="raw" rows="10" required placeholder="Paste full email body or raw text..."></textarea>
+  <textarea id="raw" name="raw" rows="10" required placeholder="Paste full email body or raw text..."></textarea>
+
+  <div class="row" style="gap:.5rem; margin:.5rem 0 1rem 0;">
+    <span class="muted">Try examples:</span>
+    <button class="btn" type="button" data-example="verify your account urgently to continue">Account verify</button>
+    <button class="btn" type="button" data-example="free gift voucher click here">Gift voucher</button>
+    <button class="btn" type="button" data-example="Team lunch next Thursday at 12 — agenda attached.">Team
+      lunch</button>
+  </div>
 
   <div class="row">
     <button type="submit">Scan</button>
     <a class="btn" href="{{ request.url_for('history') }}">View history</a>
   </div>
 </form>
+
+<script>
+  (function () {
+    const form = document.getElementById('scan-form');
+    const raw = document.getElementById('raw');
+    // Fill examples
+    document.querySelectorAll('[data-example]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        raw.value = btn.getAttribute('data-example');
+        raw.focus();
+      });
+    });
+    // Trim on submit
+    form.addEventListener('submit', () => {
+      if (raw && typeof raw.value === 'string') {
+        raw.value = raw.value.trim();
+      }
+    });
+  })();
+</script>
 {% endblock %}
