@@ -1,9 +1,8 @@
-"""scans schema upgrade (indexes, check, reasons Text, created_at default)
+"""scans schema upgrade (indexes, check, reasons Text, created_at default, add probs/details)
 
 Revision ID: a7276b896265
 Revises:
 Create Date: 2025-08-12 18:53:02.673539
-
 """
 
 from typing import Sequence, Union
@@ -21,7 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     # The batch context makes SQLite recreate the table safely
     with op.batch_alter_table("scans") as batch:
-        # reasons: String(500) -> Text (if already Text, this is a no-op)
+        # reasons: String(500) -> Text
         batch.alter_column(
             "reasons",
             existing_type=sa.String(length=500),
@@ -38,16 +37,20 @@ def upgrade() -> None:
             existing_nullable=False,
         )
 
-        # add check constraint for confidence in [0,1] (if it doesn't exist)
+        # add check constraint for confidence in [0,1]
         batch.create_check_constraint(
             "ck_scans_confidence",
             "confidence >= 0.0 AND confidence <= 1.0",
         )
 
-        # helpful indexes (if missing)
+        # helpful indexes
         batch.create_index("ix_scans_created_at", ["created_at"], unique=False)
         batch.create_index("ix_scans_label", ["label"], unique=False)
         batch.create_index("ix_scans_sender", ["sender"], unique=False)
+
+        # 🚀 NEW: add missing columns
+        batch.add_column(sa.Column("probs", sa.Text(), nullable=True))
+        batch.add_column(sa.Column("details", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
@@ -76,3 +79,7 @@ def downgrade() -> None:
             type_=sa.String(length=500),
             existing_nullable=True,
         )
+
+        # 🚀 NEW: drop the added columns
+        batch.drop_column("details")
+        batch.drop_column("probs")
