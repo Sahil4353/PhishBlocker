@@ -8,7 +8,7 @@ PhishBlocker is an AI-powered email scanner that detects phishing and spam email
 - UI with upload form and scan result display
 
 ## Technologies
-- Java, Spring Boot
+- Python
 - Weka (Machine Learning)
 - HTML/CSS/JS (Frontend)
 - MySQL or H2 Database
