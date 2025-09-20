@@ -1,3 +1,4 @@
+# app/api/routes/pages.py
 from __future__ import annotations
 
 from math import ceil
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session, load_only
 from app.core.logging import get_logger
 from app.db import SessionLocal
 from app.models.scan import Scan
-from app.services.heuristics import classify_text
+from app.services.scan_pipeline import create_scan_from_text  # ⬅️ use pipeline
 
 logger = get_logger(__name__)
 templates = Jinja2Templates(directory="app/templates")
@@ -72,48 +73,41 @@ def scan_email(
     sender: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    """Accept pasted/raw email content, classify, persist, then redirect (PRG)."""
+    """
+    Accept pasted/raw email content, classify via pipeline, persist Email+Scan,
+    then redirect (PRG) to the detail page.
+    """
     try:
         raw_text = (raw or "").strip()
+        if not raw_text:
+            return HTMLResponse(
+                "<h1>Bad Request</h1><p>Empty message body.</p>",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
 
-        label, confidence, reasons = classify_text(raw_text)
-        logger.info("classified email label=%s conf=%.3f", label, confidence)
+        # Pull model from app.state if available; pipeline should gracefully
+        # fallback to heuristics when model is None.
+        model = getattr(request.app.state, "model", None)
 
-        record = Scan(
-            subject=subject,
-            sender=sender,
-            raw=raw_text,
-            body_preview=raw_text[:MAX_BODY_PREVIEW_LEN],
-            label=label,
-            confidence=confidence,
-            reasons=", ".join(reasons),
+        # Pipeline persists Email + Scan and returns the Scan row
+        scan: Scan = create_scan_from_text(
+            db=db,
+            body_text=raw_text,
+            subject=(subject or "").strip() or None,
+            sender=(sender or "").strip() or None,
+            model=model,
         )
 
-        try:
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-        except Exception as db_err:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            logger.exception("DB commit failed while saving Scan record: %s", db_err)
-            # On error we still render a page so the user sees the message.
-            return templates.TemplateResponse(
-                "result.html",
-                {
-                    "request": request,
-                    "label": "error",
-                    "confidence": 0.0,
-                    "reasons": ["database error while saving scan"],
-                },
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        logger.info(
+            "pipeline created scan id=%s label=%s conf=%.3f",
+            scan.id,
+            scan.label,
+            float(scan.confidence) if scan.confidence is not None else -1.0,
+        )
 
         # PRG: 303 See Other -> always follow with GET to the detail page
         detail_url = request.url_for(
-            "scan_detail_view", scan_id=record.id
+            "scan_detail_view", scan_id=scan.id
         ).include_query_params(ok="1")
         return RedirectResponse(url=str(detail_url), status_code=303)
 
@@ -202,6 +196,24 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
                 status_code=status.HTTP_404_NOT_FOUND,
             )
 
+        # Prefer legacy reasons string, else try details_json.reasons (if present)
+        reasons_list = (scan.reasons or "").split(", ") if scan.reasons else []
+        if not reasons_list and hasattr(scan, "details_json") and scan.details_json:
+            try:
+                r = scan.details_json.get("reasons")
+                if isinstance(r, list):
+                    # list of {"token": "..."} or list[str]
+                    tokens = []
+                    for it in r:
+                        if isinstance(it, dict) and "token" in it:
+                            tokens.append(str(it["token"]))
+                        elif isinstance(it, str):
+                            tokens.append(it)
+                    if tokens:
+                        reasons_list = tokens[:8]
+            except Exception:
+                pass
+
         payload = {
             "id": scan.id,
             "created_at": (
@@ -215,7 +227,7 @@ def scan_detail_view(scan_id: int, request: Request, db: Session = Depends(get_d
             "confidence": float(scan.confidence)
             if scan.confidence is not None
             else None,
-            "reasons": (scan.reasons or "").split(", ") if scan.reasons else [],
+            "reasons": reasons_list,
             "body_preview": scan.body_preview,
         }
 

@@ -1,3 +1,4 @@
+# services/scan_pipeline.py
 from __future__ import annotations
 
 import json
@@ -29,6 +30,41 @@ def _parse_ts(date_hdr: str | None) -> Optional[datetime]:
         return parsedate_to_datetime(date_hdr)
     except Exception:
         return None
+
+
+def _to_reason_string(reasons: Any) -> Optional[str]:
+    """
+    Normalize explanations into a simple, human-readable string for the legacy `Scan.reasons` column.
+    - If list[{"token": "..."}], join top tokens.
+    - If list[str], join directly.
+    - Else, stringify.
+    """
+    if reasons is None:
+        return None
+    try:
+        if isinstance(reasons, list):
+            # list of dicts with 'token' OR list of strings
+            tokens = []
+            for r in reasons:
+                if isinstance(r, dict) and "token" in r:
+                    tokens.append(str(r["token"]))
+                elif isinstance(r, str):
+                    tokens.append(r)
+            if tokens:
+                return ", ".join(tokens[:8])  # keep it shortish
+        # Fallback: compact string
+        return str(reasons)
+    except Exception:
+        return None
+
+
+def _maybe_set_json_attr(obj: Any, attr: str, value: Any) -> None:
+    """
+    Safely set JSON-capable attributes if the column exists on the model.
+    (Prevents TypeErrors from kwargs on older schemas.)
+    """
+    if hasattr(obj, attr):
+        setattr(obj, attr, value)
 
 
 # --- main entry points ---
@@ -96,6 +132,7 @@ def _persist_scan(
     direction: str,
     model: Any,
 ) -> Scan:
+    # Stable id from headers; for text-only path message_id may be empty (that's fine)
     eid = _short_id(
         parsed.get("message_id", ""),
         parsed.get("subject", ""),
@@ -133,13 +170,25 @@ def _persist_scan(
         db.add(email)
 
     # Heuristics + optional model
-    hx = heuristics.analyze(parsed)  # booleans/ints
+    hx = heuristics.analyze(parsed)  # dict of booleans/ints
+
     if model:
+        # Your ModelService signature: (label, prob, reasons)
         label, confidence, reasons = model.predict_with_explanations(
             text=email.body_text or "", meta=parsed
         )
+        # Optional: full distribution if available
+        try:
+            probs_map = model.predict_proba_map(email.body_text or "")
+        except Exception:
+            probs_map = None
     else:
+        # Heuristic-only classification returns similar tuple
         label, confidence, reasons = heuristics.classify_text(email.body_text or "")
+        probs_map = None
+
+    # Keep legacy 'reasons' column human-friendly; store full reasons in details_json if available.
+    reasons_str = _to_reason_string(reasons)
 
     scan = Scan(
         email_id=email.id,
@@ -147,15 +196,20 @@ def _persist_scan(
         sender=email.sender,
         body_preview=(email.body_text or "")[:500],
         label=label,
-        confidence=float(confidence),
-        reasons=json.dumps(reasons, ensure_ascii=False)
-        if isinstance(reasons, (list, dict))
-        else (reasons or None),
+        confidence=float(confidence) if confidence is not None else None,
+        reasons=reasons_str,
         header_flags=hx,
         model_version=getattr(model, "version", None),
         direction=direction,
     )
     db.add(scan)
+
+    # If schema supports JSON fields (recent migration), persist richer outputs.
+    # Safe no-op if columns are absent.
+    _maybe_set_json_attr(scan, "details_json", {"reasons": reasons})
+    if probs_map is not None:
+        _maybe_set_json_attr(scan, "probs_json", probs_map)
+
     db.commit()
     db.refresh(scan)
     return scan

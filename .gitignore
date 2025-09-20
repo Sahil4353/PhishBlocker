@@ -38,7 +38,17 @@ Thumbs.db
 *.db-wal
 *.db-shm
 
-# === Data & models (ignore contents, keep structure) ===
+/data/raw/
+/data/processed/*.csv
+/models/*.joblib
+models/*.png
+models/*.json
+phishblocker.db*
+models/*.pt
+models/cache/
+
+
+
 data/*
 !data/
 !data/.gitkeep

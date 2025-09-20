@@ -46,6 +46,10 @@ import matplotlib.pyplot as plt
 
 log = logging.getLogger("train_baseline")
 
+# --- Windows-safe globals for CSR collation (top-level so workers can pickle) ---
+_GLOBAL_X_CSR = None
+_GLOBAL_Y_NP = None
+
 
 # ------------------------- logging -------------------------
 def setup_logging(level: str = "INFO") -> None:
@@ -56,6 +60,23 @@ def setup_logging(level: str = "INFO") -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def csr_worker_init(worker_id: int):
+    """Runs in each worker; capture dataset's CSR pointers into globals."""
+    info = torch.utils.data.get_worker_info()
+    ds = info.dataset  # our IndexCSRDataset
+    global _GLOBAL_X_CSR, _GLOBAL_Y_NP
+    _GLOBAL_X_CSR = ds.X
+    _GLOBAL_Y_NP = ds.y
+
+
+def collate_csr_indices(batch_indices):
+    """Vectorized CSR -> dense for a whole batch, using globals set in worker_init."""
+    idx = np.fromiter(batch_indices, dtype=np.int64)
+    xb = torch.from_numpy(_GLOBAL_X_CSR[idx].toarray().astype(np.float32, copy=False))
+    yb = torch.from_numpy(_GLOBAL_Y_NP[idx])
+    return xb, yb
 
 
 # ------------------------- label normalization -------------------------
@@ -143,8 +164,10 @@ class TemperatureScaler(nn.Module):
 
 
 # ------------------------- dataset (CSR -> dense per item) -------------------------
-class CSRDataset(Dataset):
-    def __init__(self, X_csr: csr_matrix, y_np: np.ndarray):
+class IndexCSRDataset(Dataset):
+    """Dataset that returns just indices; the collate_fn builds dense batches from CSR in one shot."""
+
+    def __init__(self, X_csr, y_np: np.ndarray):
         self.X = X_csr
         self.y = y_np.astype(np.int64)
 
@@ -152,10 +175,8 @@ class CSRDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        row = self.X[idx]  # 1 x D
-        x = torch.from_numpy(row.toarray().astype(np.float32, copy=False)).squeeze(0)
-        y = int(self.y[idx])
-        return x, y
+        # Return only the index; batching & CSR->dense happens in collate_fn
+        return int(idx)
 
 
 def make_loaders(
@@ -213,7 +234,7 @@ def make_loaders(
 def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
     """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
@@ -371,6 +392,60 @@ def plot_pr_roc(
     _save_plot(out_roc)
 
 
+def make_loaders_from_csr(X_tr, y_tr, X_te, y_te, num_classes: int, args, device):
+    """High-throughput DataLoaders with pinned memory and batch CSR->dense (Windows-safe)."""
+    import os
+
+    pin = device.type == "cuda"
+    cpu = max(1, (os.cpu_count() or 4) - 1)
+    num_workers = args.num_workers if args.num_workers is not None else cpu
+    if num_workers < 0:
+        num_workers = cpu
+
+    ds_tr = IndexCSRDataset(X_tr, y_tr)
+    ds_te = IndexCSRDataset(X_te, y_te)
+
+    common = dict(
+        num_workers=num_workers,
+        pin_memory=pin,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
+        collate_fn=collate_csr_indices,
+        worker_init_fn=csr_worker_init,
+    )
+
+    if args.weighted_sampler:
+        binc = np.bincount(y_tr, minlength=num_classes)
+        weights = 1.0 / np.clip(binc, 1, None)
+        sample_w = weights[y_tr]
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_w).double(),
+            num_samples=len(sample_w),
+            replacement=True,
+        )
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            **{k: v for k, v in common.items() if v is not None},
+        )
+    else:
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            shuffle=True,
+            **{k: v for k, v in common.items() if v is not None},
+        )
+
+    te_loader = DataLoader(
+        ds_te,
+        batch_size=max(256, args.batch_size),
+        shuffle=False,
+        **{k: v for k, v in common.items() if v is not None},
+    )
+    return tr_loader, te_loader
+
+
 # ------------------------- main -------------------------
 def run(args: argparse.Namespace) -> int:
     # Performance knobs to push GPU/CPU harder
@@ -440,10 +515,10 @@ def run(args: argparse.Namespace) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s | AMP: %s", device, args.mixed_precision)
 
-    # Datasets / Loaders (aggressively use CPU for loading)
-    ds_tr = CSRDataset(X_tr, y_tr)
-    ds_te = CSRDataset(X_te, y_te)
-    tr_loader, te_loader = make_loaders(ds_tr, ds_te, y_tr, num_classes, args, device)
+    # Datasets / Loaders (multiclass; batch CSR->dense for speed)
+    tr_loader, te_loader = make_loaders_from_csr(
+        X_tr, y_tr, X_te, y_te, num_classes, args, device
+    )
 
     # Model
     input_dim = X_tr.shape[1]
@@ -565,26 +640,25 @@ def run(args: argparse.Namespace) -> int:
         plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
     # Compute standard metrics (post-threshold for binary if selected)
+    # ---- Compute standard metrics (no local imports; avoids UnboundLocalError) ----
+
     if getattr(args, "binary", False) and tuned_threshold is not None:
         pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
-        y_pred = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
-        from sklearn.metrics import classification_report, confusion_matrix
+        y_true_bin = (y_val == pos_idx).astype(int)
+        y_pred_bin = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
 
         report = classification_report(
-            (y_val == pos_idx).astype(int),
-            y_pred,
-            target_names=["safe", "not_safe"],
-            output_dict=True,
+            y_true_bin, y_pred_bin, target_names=["safe", "not_safe"], output_dict=True
         )
-        cm = confusion_matrix((y_val == pos_idx).astype(int), y_pred).tolist()
-        acc = (y_pred == (y_val == pos_idx).astype(int)).mean().item()
+        cm = confusion_matrix(y_true_bin, y_pred_bin).tolist()
+        acc = float((y_pred_bin == y_true_bin).mean())
     else:
         y_pred = probs_val.argmax(axis=1)
         report = classification_report(
             y_val, y_pred, target_names=classes, output_dict=True
         )
-        cm = confusion_matrix(y_val, y_pred).tolist()
-        acc = (y_pred == y_val).mean().item()
+    cm = confusion_matrix(y_val, y_pred).tolist()
+    acc = float((y_pred == y_val).mean())
 
     log.info("[✓] Final val_acc=%.4f", acc)
 
