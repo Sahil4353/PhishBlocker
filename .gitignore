@@ -37,6 +37,7 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+
 /data/raw/
 /data/processed/*.csv
 /models/*.joblib
@@ -45,3 +46,17 @@ models/*.json
 phishblocker.db*
 models/*.pt
 models/cache/
+
+
+
+data/*
+!data/
+!data/.gitkeep
+!data/raw/
+!data/raw/.gitkeep
+!data/processed/
+!data/processed/.gitkeep
+
+models/*
+!models/
+!models/.gitkeep
