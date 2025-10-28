@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import logging
@@ -12,17 +11,17 @@ from app.api.routes.pages import router as pages_router
 from app.api.routes.scans import router as scans_router
 from app.core.config import settings
 from app.core.logging import (
-    attach_filters_to,  # helper to add our filters to uvicorn loggers
+    attach_filters_to,
     get_logger,
     setup_logging,
 )
 from app.core.middleware import RequestIdMiddleware
 from app.db import engine
-from app.models.base import Base  # ensures metadata is available
+from app.models.base import Base
 
-# ⬇️ ML model service
+# ML model service (optional fallback to heuristics if import/load fails)
 try:
-    from app.services.model import ModelService  # your loader
+    from app.services.model import ModelService
 except Exception:  # pragma: no cover
     ModelService = None  # type: ignore
 
@@ -34,61 +33,53 @@ for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 logger = get_logger(__name__)
 
 
-def _resolve_model_path() -> Path:
-    """
-    Best-effort resolution of model artifact path from settings, with a sensible default.
-    Supports any of: MODEL_PATH, MODEL_ARTIFACT, MODEL_FILE in settings.
-    """
-    candidates = []
-    for attr in ("MODEL_PATH", "MODEL_ARTIFACT", "MODEL_FILE"):
-        if hasattr(settings, attr):
-            val = getattr(settings, attr)
-            if val:
-                candidates.append(Path(str(val)))
-    # default fallback
-    candidates.append(Path("models/tfidf_lr_small_l2.joblib"))
-    for p in candidates:
-        if p and Path(p).exists():
-            return Path(p)
-    # Return the first candidate even if it doesn't exist; loader will warn.
-    return candidates[0]
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        # Dev convenience: create tables if they don't exist (skip in prod)
+        # --- DB init (dev-only convenience)
         if settings.ENV.lower() != "prod":
             Base.metadata.create_all(bind=engine)
             logger.info("DB tables ensured/created (env=%s)", settings.ENV)
         else:
             logger.info("DB migration-managed (env=prod); skipping create_all()")
 
-        # ---- Load ML model (optional, heuristics still work if it fails)
+        # --- ML model load
         app.state.model = None
-        model_path = _resolve_model_path()
         if ModelService is None:
-            logger.warning(
-                "ModelService not importable; ML disabled (heuristics only)."
-            )
+            logger.warning("ModelService not importable; ML disabled (heuristics only).")
         else:
-            try:
-                app.state.model = ModelService(str(model_path))
-                # Optional: attach a version string for scans
-                setattr(
-                    app.state.model,
-                    "version",
-                    getattr(app.state.model, "_artifact_path", None),
-                )
-                logger.info("ML model loaded: %s", model_path)
-            except Exception as e:
+            model_path = Path(settings.MODEL_PATH)
+            if not model_path.exists():
                 logger.warning(
-                    "Failed to load ML model at %s; continuing without ML. err=%s",
+                    "Configured MODEL_PATH does not exist: %s ; "
+                    "continuing without ML (heuristics only).",
                     model_path,
-                    e,
                 )
+            else:
+                try:
+                    app.state.model = ModelService(
+                        artifact_path=str(model_path),
+                        version=(settings.MODEL_VERSION or None),
+                    )
+                    logger.info(
+                        "ML model loaded",
+                        extra={
+                            "artifact": str(model_path),
+                            "model_version": getattr(app.state.model, "version", None),
+                            "env": settings.ENV,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load ML model at %s; "
+                        "continuing without ML. err=%s",
+                        model_path,
+                        e,
+                    )
 
+        # hand control back to FastAPI
         yield
+
     except Exception as e:
         logger.exception("App lifespan error: %s", e)
         raise
