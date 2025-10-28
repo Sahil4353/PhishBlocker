@@ -100,6 +100,7 @@ def create_scan_api(
             body_text=payload.text.strip(),
             subject=payload.subject,
             sender=payload.sender,
+            direction="upload",
             model=model,
         )
         logger.info("api created scan id=%s label=%s", scan.id, scan.label)
