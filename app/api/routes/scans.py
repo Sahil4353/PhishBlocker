@@ -97,7 +97,7 @@ def create_scan_api(
         model = getattr(request.app.state, "model", None)
         scan: Scan = create_scan_from_text(
             db=db,
-            text=payload.text.strip(),
+            body_text=payload.text.strip(),
             subject=payload.subject,
             sender=payload.sender,
             model=model,

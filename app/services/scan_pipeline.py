@@ -206,9 +206,9 @@ def _persist_scan(
 
     # If schema supports JSON fields (recent migration), persist richer outputs.
     # Safe no-op if columns are absent.
-    _maybe_set_json_attr(scan, "details_json", {"reasons": reasons})
+    _maybe_set_json_attr(scan, "details", {"reasons": reasons})
     if probs_map is not None:
-        _maybe_set_json_attr(scan, "probs_json", probs_map)
+        _maybe_set_json_attr(scan, "probs", probs_map)
 
     db.commit()
     db.refresh(scan)
