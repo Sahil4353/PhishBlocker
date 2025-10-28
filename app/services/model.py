@@ -1,4 +1,3 @@
-# services/model.py
 from __future__ import annotations
 
 import warnings
@@ -20,7 +19,7 @@ def _unwrap_lr(est: Any) -> Any:
     # direct LR
     if hasattr(est, "coef_"):
         return est
-    # CalibratedClassifierCV
+    # CalibratedClassifierCV / similar
     base = getattr(est, "base_estimator", None) or getattr(est, "estimator", None)
     if base is not None and hasattr(base, "coef_"):
         return base
@@ -28,11 +27,18 @@ def _unwrap_lr(est: Any) -> Any:
 
 
 class ModelService:
-    def __init__(self, artifact_path: str | Path):
+    """
+    Wraps a trained text classification pipeline (typically TF-IDF + LR).
+    Exposes:
+      - predict_with_explanations(text, meta) -> (label, prob, reasons[])
+      - predict_proba_map(text) -> {label: prob, ...}
+    """
+
+    def __init__(self, artifact_path: str | Path, version: Optional[str] = None):
         self._artifact_path = str(artifact_path)
         bundle = joblib.load(self._artifact_path)
 
-        # Support either {"pipeline": ..., "label_encoder": ...} or a plain pipeline
+        # Accept either {"pipeline": ..., "label_encoder": ...} or a plain pipeline.
         if isinstance(bundle, dict) and "pipeline" in bundle:
             self._pipe = bundle["pipeline"]
             self._le = bundle.get("label_encoder", None)
@@ -40,7 +46,7 @@ class ModelService:
             self._pipe = bundle
             self._le = None
 
-        # Determine classes (label encoder preferred, else pipeline.classes_)
+        # Class labels
         if self._le is not None and hasattr(self._le, "classes_"):
             self._classes: List[str] = list(self._le.classes_)
         else:
@@ -50,17 +56,21 @@ class ModelService:
                 "safe",
             ]
 
-        # Precompute feature names (best-effort; fall back to f{idx})
+        # Version string for audit
+        # Prefer provided version, else filename stem.
+        self.version = version or Path(self._artifact_path).stem
+
+        # cache feature names for explanation
         self._feat_names: List[str] = self._compute_feature_names()
 
-    # ---------- internals ----------
+    # ---------- internal helpers ----------
 
     def _compute_feature_names(self) -> List[str]:
         """
-        Extract feature names from a typical text-features stage:
-        - FeatureUnion or ColumnTransformer named 'features'
-        - Each subtransformer might be a Vectorizer or a Pipeline ending in a Vectorizer
-        We prefix with the transformer name to disambiguate, then strip prefix in explanations.
+        Try to recover human-readable feature names from the vectorizer(s).
+        Supports:
+        - a 'features' step that is a FeatureUnion / ColumnTransformer
+        - or a single vectorizer in the pipeline
         """
         names_out: List[str] = []
         try:
@@ -69,20 +79,18 @@ class ModelService:
             fu = None
 
         if fu is None:
-            # Try to get names from the whole pipeline (single vectorizer case)
+            # Try whole pipeline for a vectorizer
             vect = self._find_vectorizer(self._pipe)
             if vect is not None and hasattr(vect, "get_feature_names_out"):
                 try:
                     return list(vect.get_feature_names_out())
                 except Exception:
                     pass
-            # Fallback: unknown names, will be "f{i}"
             return []
 
-        # FeatureUnion-like (FeatureUnion or ColumnTransformer share attribute names)
+        # FeatureUnion / ColumnTransformer path:
         trans_list = getattr(fu, "transformer_list", None)
         if not trans_list:
-            # Possibly a Pipeline: try to find the last vectorizer inside
             vect = self._find_vectorizer(fu)
             if vect is not None and hasattr(vect, "get_feature_names_out"):
                 try:
@@ -92,32 +100,30 @@ class ModelService:
             return []
 
         for name, transformer, *rest in trans_list:
-            # ColumnTransformer has (name, transformer, columns)
-            # FeatureUnion has (name, transformer)
             vect = self._find_vectorizer(transformer)
             if vect is not None and hasattr(vect, "get_feature_names_out"):
                 try:
                     feats = list(vect.get_feature_names_out())
                     names_out.extend([f"{name}:{f}" for f in feats])
                 except Exception:
-                    # ignore this block; continue others
                     continue
         return names_out
 
     def _find_vectorizer(self, obj: Any):
         """
-        Return the last step in a Pipeline/obj that exposes get_feature_names_out (e.g., TfidfVectorizer).
+        Return the last step under `obj` that exposes get_feature_names_out (e.g. TfidfVectorizer).
         """
         if obj is None:
             return None
         if hasattr(obj, "get_feature_names_out"):
             return obj
-        # Pipelines have named_steps / steps
+
         named = getattr(obj, "named_steps", None)
         if named:
             for step_name, step in named.items():
                 if hasattr(step, "get_feature_names_out"):
                     return step
+
         steps = getattr(obj, "steps", None)
         if steps:
             for _, step in steps[::-1]:
@@ -126,9 +132,9 @@ class ModelService:
         return None
 
     def _vectorize(self, text: str) -> csr_matrix:
-        feats = self._pipe.named_steps.get("features", None)
+        feats = getattr(self._pipe, "named_steps", {}).get("features", None)
         if feats is None:
-            # Try whole pipeline minus classifier (assumes last step is 'clf')
+            # Fall back to "pipeline minus clf"
             try:
                 non_clf = self._pipe[:-1]
                 return non_clf.transform([text])
@@ -139,14 +145,13 @@ class ModelService:
         return feats.transform([text])
 
     def _get_clf_and_coefs(self) -> Tuple[Any, Optional[np.ndarray]]:
-        clf = self._pipe.named_steps.get("clf", None)
+        clf = getattr(self._pipe, "named_steps", {}).get("clf", None)
         if clf is None:
             return None, None
-        # unwrap to LR if possible (for explanations)
+
         lr = _unwrap_lr(clf)
         if lr is not None and hasattr(lr, "coef_"):
             coefs = lr.coef_
-            # Ensure 2D (n_classes, n_features) for uniform handling
             if coefs.ndim == 1:
                 coefs = coefs.reshape(1, -1)
             return clf, coefs
@@ -156,36 +161,30 @@ class ModelService:
         x = self._vectorize(text)  # (1, n_features) sparse
         clf, coefs = self._get_clf_and_coefs()
         if coefs is None:
-            # Explanations not available (non-linear model, no coef_, or wrapped unsupported)
             return []
 
-        # Handle binary case where coef_.shape[0] == 1 → weights correspond to the positive class
+        # Binary case: coef_.shape[0] == 1 → single row of weights
         if coefs.shape[0] == 1:
             w = coefs[0]
         else:
-            # Multi-class one-vs-rest
             w = coefs[class_idx]
 
-        # element-wise contribution ≈ x_j * w_j
-        # csr.multiply with 1-D array multiplies by columns
-        contrib = x.multiply(w).toarray().ravel()  # shape (n_features,)
+        contrib = x.multiply(w).toarray().ravel()  # per-feature contribution
         if contrib.size == 0:
             return []
 
         idx_sorted = np.argsort(contrib)[::-1]
         reasons: List[Dict] = []
-        feat_names = (
-            self._feat_names
-            if self._feat_names
-            else [f"f{i}" for i in range(contrib.size)]
-        )
+        feat_names = self._feat_names if self._feat_names else [
+            f"f{i}" for i in range(contrib.size)
+        ]
 
         for i in idx_sorted:
             if contrib[i] <= 0:
                 break
             tok = feat_names[i]
             if ":" in tok:
-                tok = tok.split(":", 1)[1]
+                tok = tok.split(":", 1)[1]  # drop "word:" prefix etc.
             reasons.append({"token": tok, "weight": float(contrib[i])})
             if len(reasons) >= k:
                 break
@@ -201,7 +200,8 @@ class ModelService:
         self, text: str, meta: Optional[Dict] = None
     ) -> Tuple[str, float, List[Dict]]:
         """
-        Returns (label, max_prob, reasons[]) where reasons is a list of {"token","weight"}.
+        Returns (label, max_prob, reasons[]).
+        reasons[] is [{"token": "...", "weight": float}, ...].
         """
         if not hasattr(self._pipe, "predict_proba"):
             raise RuntimeError(
@@ -213,12 +213,10 @@ class ModelService:
         label = (
             self._classes[pred_idx] if pred_idx < len(self._classes) else str(pred_idx)
         )
+
         reasons = self._top_reasons(text, pred_idx, TOP_K)
         return label, float(probs[pred_idx]), reasons
 
     def predict_proba_map(self, text: str) -> Dict[str, float]:
-        """
-        Convenience: full distribution as {class: prob}
-        """
         probs = self._pipe.predict_proba([text])[0]
         return {self._classes[i]: float(p) for i, p in enumerate(probs)}
