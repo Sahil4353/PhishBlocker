@@ -5,7 +5,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import joblib
+import joblib, torch
 import numpy as np
 from scipy.sparse import csr_matrix
 

@@ -36,22 +36,28 @@ logger = get_logger(__name__)
 
 def _resolve_model_path() -> Path:
     """
-    Best-effort resolution of model artifact path from settings, with a sensible default.
-    Supports any of: MODEL_PATH, MODEL_ARTIFACT, MODEL_FILE in settings.
+    Resolve model artifact path.
+    Priority:
+      1. MODEL_PATH from settings/.env
+      2. Default: models/tfidf_lr_small_l2.joblib
     """
-    candidates = []
-    for attr in ("MODEL_PATH", "MODEL_ARTIFACT", "MODEL_FILE"):
-        if hasattr(settings, attr):
-            val = getattr(settings, attr)
-            if val:
-                candidates.append(Path(str(val)))
-    # default fallback
-    candidates.append(Path("models/tfidf_lr_small_l2.joblib"))
-    for p in candidates:
-        if p and Path(p).exists():
-            return Path(p)
-    # Return the first candidate even if it doesn't exist; loader will warn.
-    return candidates[0]
+    # 1. If MODEL_PATH is set in .env/config, use it
+    if getattr(settings, "MODEL_PATH", None):
+        model_path = Path(settings.MODEL_PATH)
+        if model_path.exists():
+            return model_path
+        else:
+            logger.warning("MODEL_PATH set but file not found: %s", model_path)
+            return model_path
+
+    # 2. Fallback default
+    default_path = Path("models/tfidf_lr_small_l2.joblib")
+    if default_path.exists():
+        return default_path
+
+    # 3. Last resort: return default anyway (will fail later)
+    return default_path
+
 
 
 @asynccontextmanager

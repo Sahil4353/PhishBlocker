@@ -1,0 +1,36 @@
+-r requirements.base.txt
+-r requirements.torch-cu121.txt
+
+# --- Web Framework & API ---
+fastapi
+uvicorn[standard]
+
+# --- Database & Migrations ---
+SQLAlchemy
+alembic
+
+# --- Templates & Forms ---
+jinja2
+python-multipart
+
+# --- Parsing & NLP ---
+beautifulsoup4
+lxml
+nltk
+spacy
+email-normalize
+
+# --- Email & Security ---
+dkimpy
+pyspf
+
+# --- Reports & Exports ---
+weasyprint
+reportlab
+
+# --- Background Tasks (optional) ---
+celery
+redis
+
+# --- Dev Tools ---
+python-dotenv

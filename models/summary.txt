@@ -1,3 +1,2 @@
-val_acc=0.9845
-temperature=0.7706
-best_recallish=0.9938
+val_acc=0.9962
+best_recallish=0.9888
