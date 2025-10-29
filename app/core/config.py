@@ -14,6 +14,11 @@ class Settings:
       MODEL_PATH=models/tfidf_lr_small_l2.joblib
       MODEL_METRICS_PATH=models/tfidf_lr_small_l2.metrics.json
       MODEL_VERSION=tfidf_lr_small_l2@2025-10-27
+      
+    Runtime model config:
+      MODEL_PATH=models/tfidf_lr_small_l2.joblib
+      MODEL_METRICS_PATH=models/tfidf_lr_small_l2.metrics.json  # used for per-class thresholds
+      MODEL_VERSION=tfidf_lr_small_l2@2025-10-27
     """
 
     ENV: str = os.getenv("ENV", "dev")

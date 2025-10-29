@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import warnings
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +12,7 @@ TOP_K = 6
 
 
 def _unwrap_lr(est: Any) -> Any:
+    # sourcery skip: assign-if-exp, reintroduce-else
     """
     Try to unwrap a LogisticRegression from common wrappers like CalibratedClassifierCV or Pipeline.
     Returns the estimator if it has a `coef_`, else None.
@@ -30,21 +31,32 @@ class ModelService:
     """
     Wraps a trained text classification pipeline (typically TF-IDF + LR).
     Exposes:
-      - predict_with_explanations(text, meta) -> (label, prob, reasons[])
+      - predict_with_explanations(text, meta) -> (label, prob, reasons, decision_meta)
       - predict_proba_map(text) -> {label: prob, ...}
+
+    Now supports per-class probability thresholds loaded from metrics JSON.
     """
 
-    def __init__(self, artifact_path: str | Path, version: Optional[str] = None):
+    def __init__(
+        self,
+        artifact_path: str | Path,
+        version: Optional[str] = None,
+        metrics_path: Optional[str | Path] = None,
+    ):
         self._artifact_path = str(artifact_path)
         bundle = joblib.load(self._artifact_path)
 
         # Accept either {"pipeline": ..., "label_encoder": ...} or a plain pipeline.
         if isinstance(bundle, dict) and "pipeline" in bundle:
-            self._pipe = bundle["pipeline"]
-            self._le = bundle.get("label_encoder", None)
+            pipe_obj = bundle["pipeline"]
+            le_obj = bundle.get("label_encoder", None)
         else:
-            self._pipe = bundle
-            self._le = None
+            pipe_obj = bundle
+            le_obj = None
+
+        # Explicitly annotate so static analyzers don't think these are dicts.
+        self._pipe: Any = pipe_obj
+        self._le: Any = le_obj
 
         # Class labels
         if self._le is not None and hasattr(self._le, "classes_"):
@@ -56,16 +68,140 @@ class ModelService:
                 "safe",
             ]
 
-        # Version string for audit
-        # Prefer provided version, else filename stem.
+        # Version string for audit (used in Scan.model_version)
         self.version = version or Path(self._artifact_path).stem
 
-        # cache feature names for explanation
+        # Cache feature names for explanation
         self._feat_names: List[str] = self._compute_feature_names()
 
-    # ---------- internal helpers ----------
+        # Thresholds (per-class min prob needed to "claim" that class)
+        # Shape: {"phishing": 0.72, "spam": 0.4, ...}
+        self._thresholds: Dict[str, float] = {}
+        if metrics_path:
+            self._thresholds = self._load_thresholds(metrics_path)
+
+    # ---------- threshold / metrics helpers ----------
+
+    def _load_thresholds(self, metrics_path: str | Path) -> Dict[str, float]:
+        # sourcery skip: use-named-expression
+        """
+        Load per-class thresholds from the model metrics JSON.
+        We'll look for a block like:
+            {
+              "threshold_suggestions": {
+                "phishing": {"prec_at_95": 0.72, "chosen": 0.72},
+                "spam": {"prec_at_95": 0.91, "chosen": 0.91}
+              }
+            }
+
+        We'll prefer "chosen", else fallback to highest available numeric in that entry.
+        If file missing/unreadable/unexpected, we just return {} and fallback to max-prob.
+        """
+        path = Path(metrics_path)
+        if not path.exists():
+            return {}
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        raw = data.get("threshold_suggestions", {})
+        out: Dict[str, float] = {}
+        for cls_name, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            # Pick "chosen" if present, else best numeric
+            if "chosen" in entry and isinstance(entry["chosen"], (int, float)):
+                out[cls_name] = float(entry["chosen"])
+                continue
+            # fallback: take max numeric value
+            numeric_vals = [
+                float(v) for v in entry.values() if isinstance(v, (int, float))
+            ]
+            if numeric_vals:
+                out[cls_name] = max(numeric_vals)
+        return out
+
+    def _apply_thresholds(self, probs: np.ndarray) -> Tuple[str, float, Dict[str, Any]]:
+        # sourcery skip: use-named-expression
+        """
+        Given raw probs[cls_i], choose a final label using per-class thresholds.
+        Returns (final_label, final_prob, decision_meta)
+
+        decision_meta will include:
+        - "raw_top": {"label": <raw argmax>, "prob": <max_prob>}
+        - "thresholds_used": {class: tau, ...}
+        - "winner": {"label": <after-threshold label>, "prob": <prob>}
+        - "fallback_reason": str
+        """
+        # safety: align classes
+        classes = self._classes
+        raw_idx = int(np.argmax(probs))
+        raw_label = classes[raw_idx] if raw_idx < len(classes) else str(raw_idx)
+        raw_prob = float(probs[raw_idx])
+
+        # If we have no thresholds at all → just return argmax
+        if not self._thresholds:
+            return (
+                raw_label,
+                raw_prob,
+                {
+                    "raw_top": {"label": raw_label, "prob": raw_prob},
+                    "thresholds_used": {},
+                    "winner": {"label": raw_label, "prob": raw_prob},
+                    "fallback_reason": "no_thresholds_configured",
+                },
+            )
+
+        # Strategy:
+        # 1. Build list of (label, prob, passes_threshold?)
+        scored = []
+        for i, cls_name in enumerate(classes):
+            cls_prob = float(probs[i])
+            tau = float(self._thresholds.get(cls_name, 0.0))
+            passed = cls_prob >= tau
+            scored.append(
+                {
+                    "label": cls_name,
+                    "prob": cls_prob,
+                    "tau": tau,
+                    "passed": passed,
+                }
+            )
+
+        # 2. Among those that passed, choose the one with max prob
+        passed_candidates = [s for s in scored if s["passed"]]
+        if passed_candidates:
+            passed_candidates.sort(key=lambda s: s["prob"], reverse=True)
+            best = passed_candidates[0]
+            return (
+                best["label"],
+                best["prob"],
+                {
+                    "raw_top": {"label": raw_label, "prob": raw_prob},
+                    "thresholds_used": {s["label"]: s["tau"] for s in scored},
+                    "winner": {"label": best["label"], "prob": best["prob"]},
+                    "fallback_reason": "passed_threshold",
+                },
+            )
+
+        # 3. If nobody passed their threshold, fallback: pick raw argmax
+        return (
+            raw_label,
+            raw_prob,
+            {
+                "raw_top": {"label": raw_label, "prob": raw_prob},
+                "thresholds_used": {s["label"]: s["tau"] for s in scored},
+                "winner": {"label": raw_label, "prob": raw_prob},
+                "fallback_reason": "no_class_met_threshold",
+            },
+        )
+
+    # ---------- feature name / vec helpers ----------
 
     def _compute_feature_names(self) -> List[str]:
+        # sourcery skip: use-contextlib-suppress
         """
         Try to recover human-readable feature names from the vectorizer(s).
         Supports:
@@ -79,7 +215,6 @@ class ModelService:
             fu = None
 
         if fu is None:
-            # Try whole pipeline for a vectorizer
             vect = self._find_vectorizer(self._pipe)
             if vect is not None and hasattr(vect, "get_feature_names_out"):
                 try:
@@ -88,7 +223,6 @@ class ModelService:
                     pass
             return []
 
-        # FeatureUnion / ColumnTransformer path:
         trans_list = getattr(fu, "transformer_list", None)
         if not trans_list:
             vect = self._find_vectorizer(fu)
@@ -109,7 +243,7 @@ class ModelService:
                     continue
         return names_out
 
-    def _find_vectorizer(self, obj: Any):
+    def _find_vectorizer(self, obj: Any):  # sourcery skip: use-named-expression
         """
         Return the last step under `obj` that exposes get_feature_names_out (e.g. TfidfVectorizer).
         """
@@ -134,7 +268,6 @@ class ModelService:
     def _vectorize(self, text: str) -> csr_matrix:
         feats = getattr(self._pipe, "named_steps", {}).get("features", None)
         if feats is None:
-            # Fall back to "pipeline minus clf"
             try:
                 non_clf = self._pipe[:-1]
                 return non_clf.transform([text])
@@ -169,22 +302,24 @@ class ModelService:
         else:
             w = coefs[class_idx]
 
-        contrib = x.multiply(w).toarray().ravel()  # per-feature contribution
+        contrib = x.multiply(w).toarray().ravel()
         if contrib.size == 0:
             return []
 
         idx_sorted = np.argsort(contrib)[::-1]
         reasons: List[Dict] = []
-        feat_names = self._feat_names if self._feat_names else [
-            f"f{i}" for i in range(contrib.size)
-        ]
+        feat_names = (
+            self._feat_names
+            if self._feat_names
+            else [f"f{i}" for i in range(contrib.size)]
+        )
 
         for i in idx_sorted:
             if contrib[i] <= 0:
                 break
             tok = feat_names[i]
             if ":" in tok:
-                tok = tok.split(":", 1)[1]  # drop "word:" prefix etc.
+                tok = tok.split(":", 1)[1]
             reasons.append({"token": tok, "weight": float(contrib[i])})
             if len(reasons) >= k:
                 break
@@ -198,24 +333,29 @@ class ModelService:
 
     def predict_with_explanations(
         self, text: str, meta: Optional[Dict] = None
-    ) -> Tuple[str, float, List[Dict]]:
+    ) -> Tuple[str, float, List[Dict], Dict[str, Any]]:
         """
-        Returns (label, max_prob, reasons[]).
-        reasons[] is [{"token": "...", "weight": float}, ...].
+        Returns:
+          (final_label, final_prob, reasons[], decision_meta)
+
+        - final_label/final_prob are AFTER applying per-class thresholds (if any)
+        - reasons[] are the top LR features supporting the *raw* predicted class
+          (we keep this behavior the same for now)
+        - decision_meta is structured info about thresholding and fallback
         """
         if not hasattr(self._pipe, "predict_proba"):
             raise RuntimeError(
                 "Underlying pipeline has no predict_proba(). Use a probabilistic classifier."
             )
 
-        probs = self._pipe.predict_proba([text])[0]
-        pred_idx = int(np.argmax(probs))
-        label = (
-            self._classes[pred_idx] if pred_idx < len(self._classes) else str(pred_idx)
-        )
+        probs = self._pipe.predict_proba([text])[0]  # np.ndarray
+        # raw top class index
+        raw_idx = int(np.argmax(probs))
+        # explanations come from the raw top class (still most "influential" for that decision)
+        reasons = self._top_reasons(text, raw_idx, TOP_K)
 
-        reasons = self._top_reasons(text, pred_idx, TOP_K)
-        return label, float(probs[pred_idx]), reasons
+        final_label, final_prob, decision_meta = self._apply_thresholds(probs)
+        return final_label, float(final_prob), reasons, decision_meta
 
     def predict_proba_map(self, text: str) -> Dict[str, float]:
         probs = self._pipe.predict_proba([text])[0]

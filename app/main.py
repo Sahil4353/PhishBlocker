@@ -58,9 +58,11 @@ async def lifespan(app: FastAPI):
             else:
                 try:
                     app.state.model = ModelService(
-                        artifact_path=str(model_path),
-                        version=(settings.MODEL_VERSION or None),
+                    artifact_path=str(model_path),
+                    version=(settings.MODEL_VERSION or None),
+                    metrics_path=(settings.MODEL_METRICS_PATH or None),
                     )
+                    
                     logger.info(
                         "ML model loaded",
                         extra={
