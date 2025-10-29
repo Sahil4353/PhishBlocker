@@ -1,4 +1,6 @@
-Got it 🚀 — here’s your **refreshed project status snapshot**, updated to reflect all the ML, Git hygiene, and dataset handling work we’ve done over the last sprint.
+Absolutely. I’ll take your latest status snapshot, fold in everything we’ve actually finished during this session (live FastAPI app, DB, request-ID logging, `/api/scan`, runtime model service wiring, etc.), and update the TODO / roadmap so it reflects reality right now.
+
+I’ll keep the same structure you’ve been using so you can drop this straight back into the repo/docs.
 
 ---
 
@@ -8,61 +10,173 @@ Got it 🚀 — here’s your **refreshed project status snapshot**, updated to 
 
 ### App / APIs / Infra
 
-* **FastAPI app** with app-factory + lifespan and request-ID middleware.
+* **FastAPI app** with `create_app()` factory, async `lifespan`, and request-ID middleware.
 * **Routers**
 
   * **pages (HTML):** `/`, `POST /scan`, `/history`, `/scan/{id}/view`
-  * **scans (JSON/exports):** `GET /scan/{id}`, `GET /export/csv`
+
+    * `/scan` form submission works end-to-end: user pastes text → pipeline → DB → redirect to detail view.
+  * **scans (JSON/exports):**
+
+    * `POST /api/scan` (JSON inference endpoint, returns label/confidence/reasons/body_preview).
+    * `GET /api/scans` (paginated list of scans for UI/clients).
+    * `GET /api/scan/{id}` (single scan detail as JSON).
+    * `GET /export/csv` (CSV export with label/date filters and Excel formula hardening).
   * **debug:** `/health`, `/_debug/scan_count`, `/_debug/cwd`
-* **Logging & config:** env-driven logging; request-ID on all log lines; `uvicorn.*` filters.
-* **Database & migrations:** `Email` + `Scan` with FK and indexes; SQLite tuned (FK ON, WAL, etc.); Alembic wired.
-* **Batch ingestion:** `scripts/ingest_enron.py` → `data/processed/enron_parsed.csv` (local only).
-* **Services:** `parser.py`, `heuristics.py`, `scan_pipeline.py`.
-* **Pages/UI:** history, detail, CSV export (safe vs Excel formulas).
-* **DB access:** shared `get_db()` in `app/db.py`.
+* **Logging & config**
+
+  * Central logging with env-driven log level.
+  * Request-ID middleware (`X-Request-ID`), captured in contextvars and injected into every log line.
+  * Filters also applied to `uvicorn.*` so request IDs flow through access logs.
+  * Structured startup logging includes model version, artifact path, env.
+* **App config**
+
+  * `app/core/config.py` exposes:
+
+    * `ENV`, logging toggles, log level.
+    * `MODEL_PATH`, `MODEL_VERSION`, `MODEL_METRICS_PATH`.
+  * All read from environment with sane defaults.
+* **Runtime ML model loading**
+
+  * `app/main.py` loads the ML model once at startup using `ModelService`, based on `settings.MODEL_PATH`.
+  * If the artifact is missing or import fails, it falls back gracefully to heuristics-only mode and the app still runs.
+  * The loaded instance is stored on `app.state.model` and reused per request.
+* **Database & migrations**
+
+  * SQLAlchemy models: `Email` and `Scan`, with FK, indexes.
+  * Columns include:
+
+    * `Scan.label`, `confidence`, `reasons` (human-readable),
+    * `header_flags` (heuristics/metadata),
+    * `details` (full structured reasons / attribution),
+    * `probs` (full probability map per class),
+    * `model_version`,
+    * timestamps.
+  * SQLite engine with WAL/FK/autocommit tweaks (in `app/db.py`).
+  * Dev mode: `Base.metadata.create_all(...)` on startup.
+  * Prod path assumes Alembic, no auto-create.
+* **Batch ingestion**
+
+  * `scripts/ingest_enron.py` → generates `data/processed/enron_parsed.csv` locally.
+* **Services**
+
+  * `parser.py` — robust RFC-822 parser:
+
+    * pulls headers, bodies, attachments, URLs, IPs, auth results (SPF/DKIM/DMARC).
+    * extracts safe text via BeautifulSoup fallback if HTML-only.
+  * `heuristics.py` — light rule-based classifier:
+
+    * produces `(label, confidence, reasons)` for fallback mode.
+    * flags for suspicious sender/reply-to mismatch, punycode, IP links, SPF fails, etc.
+  * `scan_pipeline.py`:
+
+    * takes raw email text or raw .eml bytes,
+    * normalizes + persists an `Email`,
+    * runs heuristics and/or ML model if available,
+    * persists a `Scan` with:
+
+      * label, confidence, reasons string,
+      * `header_flags` (struct),
+      * `details` (structured reasons list),
+      * `probs` (class prob map),
+      * `model_version`,
+      * body preview,
+      * direction (`upload`).
+* **Model service**
+
+  * `app/services/model.py`:
+
+    * Loads a joblib artifact (TF-IDF + LogisticRegression / ensemble).
+    * Exposes `predict_with_explanations(text, meta)` → `(label, prob, reasons[])`.
+    * Exposes `predict_proba_map(text)` → `{class: prob, ...}`.
+    * Extracts top contributing tokens using LR coefficients and tf-idf features.
+    * Provides `.version` for audit; stored in `Scan.model_version`.
+* **Pages/UI**
+
+  * `/` — paste email text to scan.
+  * `/scan/{id}/view` — detail view shows classification, reasons, header flags.
+  * `/history` — list of recent scans (no filters yet).
+  * CSV export download.
+* **DB access**
+
+  * Shared `get_db()` dependency for both pages and API routes.
+  * Each request makes a session, closes/rolls back safely on error.
+* **Security / privacy posture**
+
+  * History view shows only `body_preview` (first ~500 chars), not full email.
+  * Full body + headers live in `Email`, which can be pruned later with TTL.
+  * `model_version` is captured so decisions are auditable by model build.
 
 ### New: ML baseline, trainer & data hygiene
 
 * **Robust trainer (`scripts/train_baseline.py`)**
 
-  * Resilient I/O: CSV/Parquet support, pyarrow fast-path, python-engine fallback with chunked loading & `on_bad_lines="skip"`.
-  * Canonical label mapping, strict schema validation, clean drop of empties/unknowns.
-  * **LR options:**
+  * Resilient I/O:
 
-    * Default: SAGA + elastic-net (`l1_ratio=0.05`, `C=0.5`, `max_iter=5000`).
-    * `--fast-l2`: LBFGS + L2 penalty (faster, recommended for large data).
-    * Exposed `--C` and `--max-iter`.
-    * Optional soft-voting **ensemble** (`LR + NB + calibrated LinearSVM`).
-  * Structured logging: env info, splits, training timings, convergence warnings, host & PID in metadata.
-  * Rich artifacts: `*.joblib` (pipeline + encoder + metadata), `*.metrics.json`, confusion matrix & PR plots.
-  * Threshold suggestions: best-F1, prec\@95, prec\@98.
-  * Exit codes: `0=ok, 2=save error, 130=interrupt, 1=unexpected`.
+    * Supports CSV or Parquet via pandas/pyarrow fast path.
+    * Chunked safe loader with `on_bad_lines="skip"` fallback.
+  * Schema enforcement:
 
+    * canonical label mapping,
+    * rejects invalid/empty rows,
+    * enforces expected text column.
+  * Logistic Regression variants:
+
+    * Elastic-net SAGA (`l1_ratio=0.05`, `C=0.5`, `max_iter=5000`) for strong, sparse phishing signal.
+    * `--fast-l2` path: LBFGS + L2 penalty for speed on big data.
+    * Tunable `--C` and `--max-iter`.
+    * Optional soft-vote ensemble (`LR + NB + calibrated LinearSVM`).
+  * Structured run logging:
+
+    * train/val split summary, timing, warnings,
+    * host/pid in metadata.
+  * Artifacts:
+
+    * `*.joblib` bundle (pipeline, vectorizer(s), label encoder).
+    * `*.metrics.json`: per-class precision/recall/F1, macro-F1, threshold suggestions (e.g. prec@95).
+    * Confusion matrices and PR curves.
+  * Threshold helpers:
+
+    * Suggested `tau` per risky class (e.g. phishing).
+    * Gives cut-points for “call phishing only if ≥0.72”, etc.
+  * Exit codes:
+
+    * `0=ok`, `2=save error`, `130=interrupt`, `1=unexpected`.
 * **Predictor (`scripts/predict.py`)**
 
-  * Prints label, per-class probs, and top LR token reasons.
+  * Loads a `.joblib` artifact.
+  * Prints:
 
+    * predicted label,
+    * per-class probabilities,
+    * top weighted tokens contributing to that call.
 * **Public datasets (local-only, ignored by git)**
 
-  * SpamAssassin (\~4.6k rows)
-  * Nazario (\~1.5k rows)
-  * Enron (\~3.1M rows, parquet preferred)
-  * Mix-balanced dataset script added.
-
+  * SpamAssassin (~4.6k rows),
+  * Nazario phishing corpus (~1.5k rows),
+  * Enron (~3.1M messages total; we prefer parquet),
+  * Script to build a balanced “mix” dataset.
 * **Artifacts (latest balanced LR run)**
 
   * Classes: `['phishing', 'safe', 'spam']`
-  * Macro-F1 = **0.957**
-  * Phishing: P≈0.98 @ R≈0.96 (τ≈0.72)
-  * Spam: P≈0.95 @ R≈0.93 (τ≈0.91)
-  * NB baseline also runs in seconds (Macro-F1≈0.899) and serves as a fast fallback.
+  * Macro-F1 ≈ **0.957**
+  * Phishing: Precision ~0.98 @ Recall ~0.96 (τ ≈ 0.72)
+  * Spam: Precision ~0.95 @ Recall ~0.93 (τ ≈ 0.91)
+  * NB baseline:
 
+    * Macro-F1 ≈ 0.899,
+    * trains in seconds,
+    * good as fallback/noise floor.
 * **Data hygiene**
 
-  * `.gitignore` tightened — ignores all `data/**/*.csv|parquet` and `models/**` artifacts (keeps `.gitkeep` + README).
-  * Added `data/README.md`: documents local-only policy, dataset structure, and CSV→Parquet conversion recipe.
-  * Large CSVs purged from git history with `git filter-repo`.
-  * Branch pushed cleanly; history free of >100MB files.
+  * `.gitignore` tightened: all `data/**` (CSVs/parquet) and `models/**` artifacts ignored, except placeholders/README.
+  * Added `data/README.md`:
+
+    * marks datasets as local-only,
+    * documents parquet conversion,
+    * clarifies not to commit Enron/mail corpora.
+  * Repo cleaned with `git filter-repo` to remove large historical CSVs.
+  * Repo pushed with no >100MB blobs.
 
 ---
 
@@ -70,109 +184,220 @@ Got it 🚀 — here’s your **refreshed project status snapshot**, updated to 
 
 * **develop** — upstream base.
 * **feat/services-pipeline** — app services (parser/heuristics/pipeline).
-* **feat/ml/robust-v1** — 🚀 active ML branch (trainer, predictor, data hygiene).
+* **feat/ml/robust-v1** — ML training pipeline, predictor, data hygiene, model service.
 * **feat/data-enron-ingest** — ingestion + schema foundations.
 
 **Flow:**
 
-* ML work stays isolated on `feat/ml/robust-v1`.
-* Rebase regularly onto `feat/services-pipeline`.
-* Once `services-pipeline` → `develop`, rebase `robust-v1` onto `develop` and open PR.
+* “Classify and persist” logic shipped first under `feat/services-pipeline`.
+* ML code stays in `feat/ml/robust-v1`, rebasing regularly on `feat/services-pipeline`.
+* After `services-pipeline` is merged into `develop`, rebase `feat/ml/robust-v1` onto `develop`, then open PR.
+* ML artifact (`models/*.joblib`) is NOT checked into git; runtime loads it from disk via `settings.MODEL_PATH`.
 
 ---
 
 ## What changed since last snapshot 🔄
 
-* Replaced fragile CSV reads with **resilient loader** (pyarrow + chunked fallback).
-* Added **fast L2/LBFGS option** (`--fast-l2`) for LR.
-* Full **robust logging & error handling** across training.
-* Added **data/README.md**, tightened `.gitignore`, purged large blobs from git history.
-* NB baseline + LR small run trained and evaluated — LR achieved Macro-F1=0.957 on balanced mix.
-* Repo successfully pushed to GitHub after history cleanup.
+* Added full FastAPI runtime bootstrap:
+
+  * `lifespan` context with DB init and ML model load-once.
+  * `RequestIdMiddleware` hooked up and logs annotated with `rid=...`.
+  * Structured startup logging for model artifact, version, env.
+* `/api/scan` and `/api/scans` are now implemented and live.
+
+  * `/api/scan` calls `scan_pipeline.create_scan_from_text()` with `app.state.model`.
+  * It returns a `ScanPayload` (id, created_at, label, confidence, reasons, etc.).
+* `/api/scan/{id}` and `/export/csv` are live.
+
+  * `/export/csv` includes Excel injection hardening (`'=`, `+`, `@` prefixed with `'`).
+* HTML flow (`POST /scan`) is wired to the *same* pipeline as `/api/scan`.
+
+  * After submit, it stores `Scan` and redirects to `/scan/{id}/view`.
+  * `/history` page pulls from DB and renders past scans.
+* `scan_pipeline.py` updated:
+
+  * Stores structured reasons in `Scan.details` (JSON).
+  * Stores class probabilities in `Scan.probs` (JSON).
+  * Records `model_version` from the loaded model service.
+  * Falls back to pure heuristics if model is not available.
+* `services/model.py` implemented:
+
+  * Loads joblib artifact,
+  * Extracts top-token feature attribution from LR weights,
+  * Exposes `predict_with_explanations()` and `predict_proba_map()`.
+* `config.py` gained model-related settings:
+
+  * `MODEL_PATH`, `MODEL_VERSION`, `MODEL_METRICS_PATH`.
+* `main.py` now:
+
+  * uses `settings.MODEL_PATH` directly,
+  * attaches the classifier instance to `app.state.model` on startup,
+  * degrades gracefully if the artifact file doesn't exist (still serves heuristics).
+* Local dev environment booted successfully on Windows:
+
+  * Ran `uvicorn app.main:app --reload --host 127.0.0.1 --port 8080`,
+  * App responded at `/`, `/history`, and `/api/*`,
+  * Verified a full scan round trip into the DB.
 
 ---
 
 ## Smoke checklist (now)
 
 ```powershell
-# Train fast baseline on balanced mix
-python scripts\train_baseline.py `
-  --inputs data\processed\mix_balanced.parquet `
-  --val-size 0.2 --seed 42 `
-  --fast-l2 --max-features-word 60000 --max-features-char 40000 `
-  --out models\tfidf_lr_small_l2.joblib
+# 1. Start the app (port 8080 just to avoid collisions on Windows)
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8080
 
-# Predict
-python scripts\predict.py --model models\tfidf_lr_small_l2.joblib `
-  "verify your account urgently to continue" `
-  "free gift voucher click here" `
-  "team lunch next Thursday at 12"
+# 2. Manual classification via API (PowerShell-friendly)
+(Invoke-WebRequest `
+  -Uri "http://127.0.0.1:8080/api/scan" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"text": "urgent: confirm your identity or your account will be disabled", "subject": "Security Alert", "sender": "security@not-bank.com"}' `
+).Content
 
-# Inspect metrics JSON
-python - << 'PY'
-import json; meta=json.load(open("models/tfidf_lr_small_l2.metrics.json"))
-print("Macro-F1:", round(meta["metrics"]["macro avg"]["f1-score"],3))
-print("Thresholds:", meta["threshold_suggestions"])
-PY
+# You should get JSON like:
+# {
+#   "id": 2,
+#   "created_at": "...",
+#   "subject": "Security Alert",
+#   "sender": "security@not-bank.com",
+#   "label": "phishing",
+#   "confidence": 0.94,
+#   "reasons": ["confirm","identity","disabled",...],
+#   "body_preview": "urgent: confirm your identity..."
+# }
+
+# 3. Hit history page in browser
+# http://127.0.0.1:8080/history
+
+# 4. Export CSV
+# http://127.0.0.1:8080/export/csv?label=phishing&date_from=2025-10-28
 ```
+
+And:
+If you drop a trained artifact at `models/tfidf_lr_small_l2.joblib`, restart, and see `ML model loaded` in logs on startup — you’re running ML, not heuristics.
 
 ---
 
 ## Roadmap (updated)
 
-### M1 — MVP polish (Local) · **nearly done**
+### M1 — MVP polish (Local) · ✅ DONE
 
-* [ ] Wire `POST /scan` to ML pipeline (`predict_with_explanations`).
-* [ ] Add `/api/scan (POST)` + `/api/scans (GET)`.
-* [ ] Use LR artifact + thresholds JSON.
+* [x] Wire `POST /scan` (HTML form) to shared pipeline.
+* [x] Wire `POST /api/scan` (JSON) to same pipeline.
+* [x] Save classification results in DB (`Scan` row with label, confidence, reasons).
+* [x] Expose `/api/scans` and `/api/scan/{id}` for UI/clients.
+* [x] Add CSV export with basic filters + Excel injection safety.
+* [x] Load LR model artifact at app startup and attach to `app.state.model` (fallback to heuristics if not found).
+* [x] Capture `model_version` and per-class `probs` / `details` in DB.
+* [x] Request-ID middleware + structured logging.
+* [x] requirements/base.txt now includes FastAPI + runtime deps (`fastapi`, `uvicorn`, `sqlalchemy`, `pydantic`, `python-multipart`, `jinja2`) so a fresh `pip install -r requirements.base.txt` can boot the whole app.
+
+→ M1 is no longer “nearly done.” M1 is functionally delivered.
 
 ### M2 — Data & thresholds
 
-* [ ] Augment phishing corpora, de-dup & clean.
-* [ ] Downsample safe / up-weight spam+phishing.
-* [ ] Adopt thresholds from metrics JSON into UI defaults.
+* [ ] Augment phishing corpora, dedupe & normalize text (strip signatures, etc.).
+* [ ] Rebalance training data:
+
+  * downsample “safe,”
+  * upsample/reweight phishing & spam.
+* [ ] Bake per-class thresholds into runtime:
+
+  * load `*.metrics.json`,
+  * apply per-class `tau` so borderline low-confidence phishing defaults to spam/safe instead of phishing.
+* [ ] Surface chosen threshold(s) / operating point in UI (e.g. “High-confidence phishing only”).
 
 ### M3 — Services integration (ML)
 
-* [ ] Add `app/services/model.py` loader (joblib + thresholds).
-* [ ] Integrate into `scan_pipeline.py`.
-* [ ] If ensemble, pull LR coefficients for explanations.
+* [ ] Feed `threshold_suggestions` from training (`prec@95`, etc.) into `ModelService`, not just raw probs.
+
+  * i.e. final runtime label decision should be “phishing above τ_phishing, spam above τ_spam, else safe.”
+* [ ] Persist that threshold policy somewhere versioned (so we can audit “why was this marked phishing?”).
+* [ ] Expose richer explanations to the UI:
+
+  * show “top suspicious tokens” and “header anomalies” together.
+* [ ] Add lightweight model health telemetry (counts per label per day).
 
 ### M4 — Feedback & filters
 
-* [ ] Add feedback UI for corrected labels.
-* [ ] History filters: label/date/sender.
+* [ ] Add feedback UI:
+
+  * On `/scan/{id}/view`, let user mark “this is actually safe / spam / phishing”.
+  * Store that correction in DB for future retraining.
+* [ ] Add filters to `/history` and `/api/scans`:
+
+  * filter by label,
+  * filter by sender / domain,
+  * filter by date range.
+* [ ] Add pagination / query params to `/history` so UI isn’t just dumping latest N scans blindly.
 
 ### M5 — CI & packaging
 
-* [ ] Pre-commit hooks (black, ruff, isort).
-* [ ] Basic pytest suite.
-* [ ] GitHub Actions workflow (lint/test/build).
-* [ ] Docker image; Alembic migrations on startup.
+* [ ] Add pre-commit (black, ruff, isort).
+* [ ] Add basic pytest coverage:
+
+  * parser behavior on tricky emails,
+  * pipeline end-to-end on sample text,
+  * `/api/scan` response shape.
+* [ ] GitHub Actions:
+
+  * lint,
+  * run tests,
+  * build image.
+* [ ] Add Dockerfile:
+
+  * runs uvicorn,
+  * runs Alembic migrations (instead of `create_all`) on startup in prod.
 
 ### M6 — Safety & retention
 
-* [ ] TTL for raw email bodies, purge jobs.
-* [ ] Security headers & rate limiting.
+* [ ] Add TTL / purge job:
+
+  * delete or redact `Email.body_text`, `Email.html_raw`, and maybe `Email.raw_headers` after N days,
+  * keep `Scan` rows + metadata for analytics / audit.
+* [ ] Add security headers & basic rate limiting / abuse control on `/api/scan`.
+* [ ] Consider masking PII-ish content in long-term logs (sender email, etc.) if needed.
 
 ---
 
 ## Git hygiene
 
 * **Artifacts & datasets ignored.**
-* **Clean history:** big CSVs removed with `git filter-repo`.
-* **Branching:** `feat/<area>-<slug>`; short-lived, rebased often.
-* **PRs:** small, single-purpose; squash & merge into `develop`.
-* **Tags:** code-only tags (`ml/v2-<date>`); artifacts tracked in JSON metadata.
+
+  * `data/**/*.csv` / `data/**/*.parquet` and `models/**` are gitignored.
+  * We keep placeholders like `.gitkeep` and `data/README.md`.
+* **Local-only corpora policy in `data/README.md`.**
+
+  * Makes it clear Enron / phishing corpora must not be pushed.
+* **Large blobs removed from history** via `git filter-repo`.
+* **Branching model**
+
+  * Feature branches as `feat/<area>-<slug>`.
+  * Keep branches short-lived, rebase often, squash merge.
+* **Versioning**
+
+  * Code tagged by lightweight tags like `ml/v2-2025-10-29`.
+  * Model artifacts versioned by filename/metadata, not pushed to git.
+  * `Scan.model_version` captures which model produced which decision.
 
 ---
 
-✅ Project is now at a strong **baseline ML milestone**:
+✅ TL;DR
 
-* Training pipeline is robust and reproducible.
-* Balanced LR baseline exceeds KPI (≥95% precision @ ≥85% recall).
-* Repo is cleaned and ready for PR into `develop`.
+* M1 is now delivered. You have a working phishing classifier service that:
 
----
+  * ingests text,
+  * scores it,
+  * stores structured results,
+  * gives you UI, API, CSV,
+  * runs locally,
+  * and is model-ready (loads LR joblib if present).
 
-👉 Do you want me to draft the **tiny `app/services/model.py` loader** next, so you can wire the LR artifact into `/scan` and close out M1?
+* Next focus is M2/M3:
+
+  * bring in calibrated thresholds from training,
+  * enrich explanations,
+  * add filtering and feedback so you can start collecting real correction data to retrain.
+
+You’re in great shape.
