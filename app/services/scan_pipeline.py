@@ -1,7 +1,5 @@
-# services/scan_pipeline.py
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
@@ -43,7 +41,6 @@ def _to_reason_string(reasons: Any) -> Optional[str]:
         return None
     try:
         if isinstance(reasons, list):
-            # list of dicts with 'token' OR list of strings
             tokens = []
             for r in reasons:
                 if isinstance(r, dict) and "token" in r:
@@ -52,7 +49,6 @@ def _to_reason_string(reasons: Any) -> Optional[str]:
                     tokens.append(r)
             if tokens:
                 return ", ".join(tokens[:8])  # keep it shortish
-        # Fallback: compact string
         return str(reasons)
     except Exception:
         return None
@@ -172,22 +168,37 @@ def _persist_scan(
     # Heuristics + optional model
     hx = heuristics.analyze(parsed)  # dict of booleans/ints
 
+    decision_meta: Dict[str, Any] | None = None
+
     if model:
-        # Your ModelService signature: (label, prob, reasons)
-        label, confidence, reasons = model.predict_with_explanations(
-            text=email.body_text or "", meta=parsed
-        )
+        # NEW MODEL SIGNATURE:
+        # (label, confidence, reasons, decision_meta)
+        try:
+            label, confidence, reasons, decision_meta = model.predict_with_explanations(
+                text=email.body_text or "", meta=parsed
+            )
+        except TypeError:
+            # Backward compatibility in case model still returns 3-tuple
+            label, confidence, reasons = model.predict_with_explanations(
+                text=email.body_text or "", meta=parsed
+            )
+            decision_meta = None
+
         # Optional: full distribution if available
         try:
             probs_map = model.predict_proba_map(email.body_text or "")
         except Exception:
             probs_map = None
     else:
-        # Heuristic-only classification returns similar tuple
+        # Heuristic-only classification returns 3-tuple
         label, confidence, reasons = heuristics.classify_text(email.body_text or "")
+        decision_meta = {
+            "raw_top": {"label": label, "prob": confidence},
+            "fallback_reason": "heuristics_only",
+        }
         probs_map = None
 
-    # Keep legacy 'reasons' column human-friendly; store full reasons in details_json if available.
+    # Keep legacy 'reasons' column human-friendly
     reasons_str = _to_reason_string(reasons)
 
     scan = Scan(
@@ -204,9 +215,16 @@ def _persist_scan(
     )
     db.add(scan)
 
-    # If schema supports JSON fields (recent migration), persist richer outputs.
-    # Safe no-op if columns are absent.
-    _maybe_set_json_attr(scan, "details", {"reasons": reasons})
+    # Persist richer outputs into JSON columns:
+    # - details: threshold decision info + full reasons list
+    # - probs: full probability distribution if available
+    enriched_details: Dict[str, Any] = {}
+    if decision_meta:
+        enriched_details.update(decision_meta)
+    enriched_details["reasons"] = reasons
+
+    _maybe_set_json_attr(scan, "details", enriched_details)
+
     if probs_map is not None:
         _maybe_set_json_attr(scan, "probs", probs_map)
 
