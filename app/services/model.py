@@ -12,6 +12,7 @@ TOP_K = 6
 
 
 def _unwrap_lr(est: Any) -> Any:
+    # sourcery skip: assign-if-exp, reintroduce-else
     """
     Try to unwrap a LogisticRegression from common wrappers like CalibratedClassifierCV or Pipeline.
     Returns the estimator if it has a `coef_`, else None.
@@ -47,11 +48,15 @@ class ModelService:
 
         # Accept either {"pipeline": ..., "label_encoder": ...} or a plain pipeline.
         if isinstance(bundle, dict) and "pipeline" in bundle:
-            self._pipe = bundle["pipeline"]
-            self._le = bundle.get("label_encoder", None)
+            pipe_obj = bundle["pipeline"]
+            le_obj = bundle.get("label_encoder", None)
         else:
-            self._pipe = bundle
-            self._le = None
+            pipe_obj = bundle
+            le_obj = None
+
+        # Explicitly annotate so static analyzers don't think these are dicts.
+        self._pipe: Any = pipe_obj
+        self._le: Any = le_obj
 
         # Class labels
         if self._le is not None and hasattr(self._le, "classes_"):
@@ -78,6 +83,7 @@ class ModelService:
     # ---------- threshold / metrics helpers ----------
 
     def _load_thresholds(self, metrics_path: str | Path) -> Dict[str, float]:
+        # sourcery skip: use-named-expression
         """
         Load per-class thresholds from the model metrics JSON.
         We'll look for a block like:
@@ -111,17 +117,14 @@ class ModelService:
                 continue
             # fallback: take max numeric value
             numeric_vals = [
-                float(v)
-                for v in entry.values()
-                if isinstance(v, (int, float))
+                float(v) for v in entry.values() if isinstance(v, (int, float))
             ]
             if numeric_vals:
                 out[cls_name] = max(numeric_vals)
         return out
 
-    def _apply_thresholds(
-        self, probs: np.ndarray
-    ) -> Tuple[str, float, Dict[str, Any]]:
+    def _apply_thresholds(self, probs: np.ndarray) -> Tuple[str, float, Dict[str, Any]]:
+        # sourcery skip: use-named-expression
         """
         Given raw probs[cls_i], choose a final label using per-class thresholds.
         Returns (final_label, final_prob, decision_meta)
@@ -140,12 +143,16 @@ class ModelService:
 
         # If we have no thresholds at all → just return argmax
         if not self._thresholds:
-            return raw_label, raw_prob, {
-                "raw_top": {"label": raw_label, "prob": raw_prob},
-                "thresholds_used": {},
-                "winner": {"label": raw_label, "prob": raw_prob},
-                "fallback_reason": "no_thresholds_configured",
-            }
+            return (
+                raw_label,
+                raw_prob,
+                {
+                    "raw_top": {"label": raw_label, "prob": raw_prob},
+                    "thresholds_used": {},
+                    "winner": {"label": raw_label, "prob": raw_prob},
+                    "fallback_reason": "no_thresholds_configured",
+                },
+            )
 
         # Strategy:
         # 1. Build list of (label, prob, passes_threshold?)
@@ -168,24 +175,33 @@ class ModelService:
         if passed_candidates:
             passed_candidates.sort(key=lambda s: s["prob"], reverse=True)
             best = passed_candidates[0]
-            return best["label"], best["prob"], {
-                "raw_top": {"label": raw_label, "prob": raw_prob},
-                "thresholds_used": {s["label"]: s["tau"] for s in scored},
-                "winner": {"label": best["label"], "prob": best["prob"]},
-                "fallback_reason": "passed_threshold",
-            }
+            return (
+                best["label"],
+                best["prob"],
+                {
+                    "raw_top": {"label": raw_label, "prob": raw_prob},
+                    "thresholds_used": {s["label"]: s["tau"] for s in scored},
+                    "winner": {"label": best["label"], "prob": best["prob"]},
+                    "fallback_reason": "passed_threshold",
+                },
+            )
 
         # 3. If nobody passed their threshold, fallback: pick raw argmax
-        return raw_label, raw_prob, {
-            "raw_top": {"label": raw_label, "prob": raw_prob},
-            "thresholds_used": {s["label"]: s["tau"] for s in scored},
-            "winner": {"label": raw_label, "prob": raw_prob},
-            "fallback_reason": "no_class_met_threshold",
-        }
+        return (
+            raw_label,
+            raw_prob,
+            {
+                "raw_top": {"label": raw_label, "prob": raw_prob},
+                "thresholds_used": {s["label"]: s["tau"] for s in scored},
+                "winner": {"label": raw_label, "prob": raw_prob},
+                "fallback_reason": "no_class_met_threshold",
+            },
+        )
 
     # ---------- feature name / vec helpers ----------
 
     def _compute_feature_names(self) -> List[str]:
+        # sourcery skip: use-contextlib-suppress
         """
         Try to recover human-readable feature names from the vectorizer(s).
         Supports:
@@ -227,7 +243,7 @@ class ModelService:
                     continue
         return names_out
 
-    def _find_vectorizer(self, obj: Any):
+    def _find_vectorizer(self, obj: Any):  # sourcery skip: use-named-expression
         """
         Return the last step under `obj` that exposes get_feature_names_out (e.g. TfidfVectorizer).
         """
