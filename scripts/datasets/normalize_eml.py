@@ -77,7 +77,7 @@ def is_archive(p: Path) -> bool:
 def iter_message_files(root: Path) -> Iterable[Path]:
     """
     Yield likely message files:
-    - include files with .eml, .txt, or NO extension (common in Enron maildir & SpamAssassin)
+    - include files with .eml, .txt, NO extension, or trailing-dot names (e.g., '311.')
     - skip archives and obvious non-files
     """
     for p in root.rglob("*"):
@@ -86,9 +86,8 @@ def iter_message_files(root: Path) -> Iterable[Path]:
         if is_archive(p):
             continue
         ext = p.suffix.lower()
-        if ext in (".eml", ".txt") or ext == "":
+        if ext in (".eml", ".txt", ".", ""):
             yield p
-
 
 # ----------------------------
 # Core normalization
