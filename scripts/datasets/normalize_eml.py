@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 from __future__ import annotations
-
+import os
 import argparse
 import logging
 import re
@@ -158,33 +158,37 @@ def is_archive(p: Path) -> bool:
 
 def iter_message_files(root: Path) -> Iterable[Path]:
     """
-    Yield likely message files:
-    - include files with .eml, .txt, NO extension, or trailing-dot names (e.g., '311.')
-    - also include numeric filenames (e.g., '123' or '123.')
-    - skip archives and directories
-    NOTE: Avoid Path.is_file() here because trailing-dot files on Windows can return False.
+    Windows-safe file discovery:
+    - On Windows, walk with \\?\\ extended-length paths so trailing-dot files are yielded.
+    - On other platforms, fall back to pathlib.rglob.
+    - Skip archives; otherwise yield all files (filtering happens in parsing).
     """
+    if sys.platform.startswith("win"):
+        # Build extended-length absolute root (\\?\C:\...\maildir)
+        abs_root = str(root.resolve())
+        if not abs_root.startswith("\\\\?\\"):
+            walk_root = "\\\\?\\" + abs_root
+        else:
+            walk_root = abs_root
+
+        for dirpath, dirnames, filenames in os.walk(walk_root):
+            # Convert back to normal form for Path/relpath ops
+            normal_dirpath = dirpath[4:] if dirpath.startswith("\\\\?\\") else dirpath
+            for fn in filenames:
+                normal_full = os.path.join(normal_dirpath, fn)
+                p = Path(normal_full)
+                if is_archive(p):
+                    continue
+                yield p
+        return
+
+    # Non-Windows: pathlib is fine
     for p in root.rglob("*"):
-        # skip directories explicitly; everything else we treat as a candidate path
         if p.is_dir():
             continue
         if is_archive(p):
             continue
-
-        name = p.name
-        ext = p.suffix.lower()
-
-        # Accept common email-file patterns
-        if ext in (".eml", ".txt", ".", ""):
-            yield p
-            continue
-
-        # Accept numeric file names with or without trailing dot
-        nm = name.rstrip(".")
-        if nm.isdigit():
-            yield p
-            continue
-
+        yield p
 
 # ----------------------------
 # Diagnostics & counters
