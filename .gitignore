@@ -39,15 +39,23 @@ Thumbs.db
 *.db-shm
 
 /data/raw/
+data/raw/**
+data/processed/*.parquet
 /data/processed/*.csv
 /models/*.joblib
 models/*.png
 models/*.json
+models/**
 phishblocker.db*
 models/*.pt
 models/cache/
 
-
+# debug artifacts
+**/*.pt
+**/*.joblib
+**/*.metrics.json
+**/summary.txt
+**/*.png
 
 data/*
 !data/
