@@ -50,6 +50,18 @@ def _strip_html(html: str) -> str:
     return html
 
 
+def safe_relpath(p: Path, base: Path) -> str:
+    """Return p relative to base, tolerating absolute/relative mix and Windows quirks."""
+    try:
+        return str(p.resolve().relative_to(base.resolve()))
+    except Exception:
+        try:
+            return os.path.relpath(str(p), start=str(base))
+        except Exception:
+            # last resort: fall back to filename
+            return p.name
+
+
 def _best_text_from_message(msg: EmailMessage) -> str:
     """
     Prefer text/plain; else use text/html (stripped).
@@ -190,6 +202,7 @@ def iter_message_files(root: Path) -> Iterable[Path]:
             continue
         yield p
 
+
 # ----------------------------
 # Diagnostics & counters
 # ----------------------------
@@ -226,7 +239,7 @@ def sniff_content_type(p: Path) -> Optional[str]:
 
 
 def load_text(p: Path) -> str:
-    """
+    r"""
     Read file robustly on Windows (supports trailing-dot names) and elsewhere.
     Uses \\?\ prefix on Windows to avoid path normalization that strips trailing dots.
     """
@@ -302,7 +315,7 @@ def build_rows(
                 "body_text": text,
                 "label": label,
                 "source": source,
-                "relpath": str(p.relative_to(base)),
+                "relpath": safe_relpath(p, base),
                 "len_chars": len(text),
             }
         )
