@@ -21,6 +21,7 @@ from email.message import EmailMessage
 # ----------------------------
 
 logger = logging.getLogger("normalize_eml")
+_PROJECT_PARSER_LOGGED = False
 
 
 def setup_logging(level: str, debug_flag: bool) -> None:
@@ -150,7 +151,10 @@ def _extract_text_with_app(raw: Union[BytesLike, str]) -> str:
         # If project parser returns empty, fall back:
         return _extract_text_default(raw)
     except Exception as e:
-        logger.debug("project parser unavailable or failed: %s", e)
+        global _PROJECT_PARSER_LOGGED
+        if not _PROJECT_PARSER_LOGGED:
+            logger.debug("project parser unavailable or failed: %s", e)
+            _PROJECT_PARSER_LOGGED = True
         return _extract_text_default(raw)
 
 
@@ -222,13 +226,50 @@ class Counters:
 
 def sniff_content_type(p: Path) -> Optional[str]:
     """
-    Fast-ish ctype sniff: parse headers and get content_type of root part.
-    Only used when --ctype-sample > 0.
+    Cheap, Windows-safe sniff of Content-Type from the header only.
+    - Reads only the first ~8 KiB (not the whole file).
+    - Uses \\?\\ extended path on Windows so trailing-dot files work.
+    - Falls back to None on any error quickly.
     """
     try:
-        raw = p.read_bytes()
-        msg = cast(EmailMessage, email.message_from_bytes(raw, policy=policy.default))
-        return (msg.get_content_type() or "").lower()
+        if sys.platform.startswith("win"):
+            abs_str = str(p.resolve())
+            if not abs_str.startswith("\\\\?\\"):
+                win_path = "\\\\?\\" + abs_str
+            else:
+                win_path = abs_str
+            with open(win_path, "rb") as f:
+                head = f.read(8192)
+        else:
+            with open(p, "rb") as f:
+                head = f.read(8192)
+
+        # Split headers from body if possible
+        if b"\r\n\r\n" in head:
+            headers = head.split(b"\r\n\r\n", 1)[0]
+        elif b"\n\n" in head:
+            headers = head.split(b"\n\n", 1)[0]
+        else:
+            headers = head
+
+        # Handle folded headers (continuation lines)
+        lines = []
+        for line in headers.splitlines():
+            if lines and (line.startswith(b" ") or line.startswith(b"\t")):
+                lines[-1] += b" " + line.strip()
+            else:
+                lines.append(line.strip())
+
+        for line in lines:
+            if line.lower().startswith(b"content-type:"):
+                val = line.split(b":", 1)[1].strip()
+                # Take token before ';' (ignore params)
+                val = val.split(b";", 1)[0].strip()
+                try:
+                    return val.decode("utf-8", "ignore").lower()
+                except Exception:
+                    return None
+        return None
     except Exception:
         return None
 
