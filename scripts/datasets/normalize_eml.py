@@ -160,16 +160,30 @@ def iter_message_files(root: Path) -> Iterable[Path]:
     """
     Yield likely message files:
     - include files with .eml, .txt, NO extension, or trailing-dot names (e.g., '311.')
-    - skip archives and obvious non-files
+    - also include numeric filenames (e.g., '123' or '123.')
+    - skip archives and directories
+    NOTE: Avoid Path.is_file() here because trailing-dot files on Windows can return False.
     """
     for p in root.rglob("*"):
-        if not p.is_file():
+        # skip directories explicitly; everything else we treat as a candidate path
+        if p.is_dir():
             continue
         if is_archive(p):
             continue
+
+        name = p.name
         ext = p.suffix.lower()
+
+        # Accept common email-file patterns
         if ext in (".eml", ".txt", ".", ""):
             yield p
+            continue
+
+        # Accept numeric file names with or without trailing dot
+        nm = name.rstrip(".")
+        if nm.isdigit():
+            yield p
+            continue
 
 
 # ----------------------------
