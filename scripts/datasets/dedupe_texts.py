@@ -105,3 +105,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# python scripts/datasets/dedupe_texts.py `
+#   --inputs data/processed/spamassassin.csv data/processed/nazario.csv data/processed/enron.csv `
+#   --out    data/processed/mix_dedup.csv

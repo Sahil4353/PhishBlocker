@@ -4,40 +4,55 @@ import argparse, sys
 from pathlib import Path
 from typing import Iterable, Tuple, List
 import pandas as pd
+from typing import Union
+from email import policy
+import email
 
 
 # Try to use your project parser; fallback to a local extractor if import path differs
-def _extract_text_default(raw: bytes | str) -> str:
-    try:
-        import email
-        from email import policy
+BytesLike = Union[bytes, bytearray, memoryview]
 
-        if isinstance(raw, bytes):
+
+def _extract_text_default(raw: Union[BytesLike, str]) -> str:
+    """
+    Safe parser that works for bytes/bytearray/memoryview/str.
+    Prefers text/plain; falls back to empty string on errors.
+    """
+    try:
+        if isinstance(raw, (bytes, bytearray, memoryview)):
             msg = email.message_from_bytes(raw, policy=policy.default)
         else:
+            # raw is str here
             msg = email.message_from_string(raw, policy=policy.default)
+
         parts = []
         if msg.is_multipart():
             for p in msg.walk():
                 if p.get_content_type() == "text/plain":
-                    parts.append(p.get_content())
+                    # get_content() handles decoding under policy=default
+                    parts.append(p.get_content() or "")
         else:
             if msg.get_content_type() == "text/plain":
-                parts.append(msg.get_content())
-        return "\n".join([p or "" for p in parts]).strip()
+                parts.append(msg.get_content() or "")
+        return "\n".join(parts).strip()
     except Exception:
         return ""
 
 
-def _extract_text_with_app(raw: bytes | str) -> str:
+def _extract_text_with_app(raw: Union[BytesLike, str]) -> str:
+    """
+    Try project’s parser first; fall back to default.
+    """
     try:
-        # adjust if your parser lives elsewhere
+        # Adjust import if your parser lives elsewhere
         from app.services.parser import extract_body_text  # type: ignore
 
-        return extract_body_text(raw)
+        txt = extract_body_text(raw)  # your function may accept bytes or str
+        if not isinstance(txt, str):
+            txt = str(txt or "")
+        return txt
     except Exception:
         return _extract_text_default(raw)
-
 
 def iter_files(root: Path, exts: Tuple[str, ...] = (".eml", ".txt")) -> Iterable[Path]:
     for p in root.rglob("*"):
@@ -144,3 +159,10 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+    
+# python scripts/datasets/normalize_eml.py `
+#   --spamassassin-root data/raw/spamassassin `
+#   --nazario-root      data/raw/nazario `
+#   --enron-maildir     data/raw/enron/maildir `
+#   --min-chars 20 `
+#   --out-dir           data/processed
