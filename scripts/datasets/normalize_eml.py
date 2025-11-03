@@ -172,6 +172,18 @@ def is_archive(p: Path) -> bool:
     return p.suffix.lower() in ARCHIVE_SUFFIXES
 
 
+def get_size_fast(p: Path) -> Optional[int]:
+    """Windows-safe filesize; returns None on error."""
+    try:
+        if sys.platform.startswith("win"):
+            abs_str = str(p.resolve())
+            win_path = abs_str if abs_str.startswith("\\\\?\\") else "\\\\?\\" + abs_str
+            return os.path.getsize(win_path)
+        return os.path.getsize(p)
+    except Exception:
+        return None
+
+
 def iter_message_files(root: Path) -> Iterable[Path]:
     """
     Windows-safe file discovery:
@@ -310,6 +322,9 @@ def build_rows(
     min_chars: int,
     debug_sample: int = 0,
     ctype_sample: int = 0,
+    max_candidates: int = 0,
+    size_max_bytes: int = 0,
+    progress_every: int = 10000,
 ) -> Tuple[List[dict], Counters]:
     rows: List[dict] = []
     ctr = Counters(ctype_counter=Counter())
@@ -318,14 +333,33 @@ def build_rows(
     for p in paths:
         ctr.files_seen += 1
 
-        # archive check (should already be filtered)
+        # skip dirs already (iterator shouldn’t pass them) + archives
         if is_archive(p):
             ctr.archives_skipped += 1
             continue
 
-        ctr.candidates += 1
+        # optional size filter (cheap gate)
+        if size_max_bytes and size_max_bytes > 0:
+            sz = get_size_fast(p)
+            if sz is not None and sz > size_max_bytes:
+                continue
 
-        # optional content-type telemetry
+        ctr.candidates += 1
+        if progress_every and ctr.candidates % progress_every == 0:
+            logger.info(
+                "[%s] scanned candidates=%d ok=%d empty=%d short=%d",
+                source,
+                ctr.candidates,
+                ctr.extracted_ok,
+                ctr.empty_after_parse,
+                ctr.too_short,
+            )
+
+        # optional cap on candidates
+        if max_candidates and ctr.candidates > max_candidates:
+            break
+
+        # optional content-type telemetry (now cheap & win-safe)
         if ctype_sample and ctr.candidates <= ctype_sample:
             ctype = sniff_content_type(p)
             if ctype:
@@ -343,7 +377,6 @@ def build_rows(
             continue
 
         text = text.replace("\r\n", "\n").strip()
-
         if len(text) < min_chars:
             ctr.too_short += 1
             continue
@@ -362,7 +395,6 @@ def build_rows(
         )
         ctr.extracted_ok += 1
 
-    # Print a compact source summary here; caller also prints totals.
     logger.info(
         "[%s] files_seen=%s candidates=%s ok=%s empty=%s short=%s exceptions=%s",
         source,
@@ -373,12 +405,10 @@ def build_rows(
         ctr.too_short,
         ctr.exceptions,
     )
-
     if sampled:
         logger.debug("[%s] sample files:", source)
         for sp in sampled:
             logger.debug("  %s", sp)
-
     if ctr.ctype_counter:
         logger.debug(
             "[%s] content types (first %d candidates): %s",
@@ -386,7 +416,6 @@ def build_rows(
             ctype_sample,
             dict(ctr.ctype_counter.most_common(10)),
         )
-
     return rows, ctr
 
 
@@ -432,6 +461,25 @@ def main() -> int:
         default=50,
         help="Sample size for content-type telemetry per source (0=off)",
     )
+    ap.add_argument(
+        "--max-candidates-per-source",
+        type=int,
+        default=0,
+        help="Limit files processed per source (0 = unlimited)",
+    )
+    ap.add_argument(
+        "--size-max-bytes",
+        type=int,
+        default=2_000_000,
+        help="Skip files larger than this many bytes (0 = no cap)",
+    )
+    ap.add_argument(
+        "--progress-every",
+        type=int,
+        default=10000,
+        help="Log a progress line every N candidates",
+    )
+
     args = ap.parse_args()
 
     setup_logging(args.log_level, args.debug)
