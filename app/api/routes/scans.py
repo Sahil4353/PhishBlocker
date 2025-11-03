@@ -247,22 +247,20 @@ def export_csv(
     label: Optional[Literal["safe", "spam", "phishing"]] = Query(default=None),
     date_from: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    sender: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
 ):
-    """
-    Stream a CSV of scans.
-    Filters:
-      - label: safe|spam|phishing
-      - date_from/date_to: YYYY-MM-DD (inclusive)
-    """
     try:
         q = db.query(Scan)
-
         if label:
             q = q.filter(Scan.label == label)
+        if sender:
+            q = q.filter(Scan.sender == sender)
+        if domain:
+            q = q.filter(func.substr(Scan.sender, func.instr(Scan.sender, "@") + 1) == domain)
 
         start_dt = _parse_date(date_from) if date_from else None
         end_dt = _parse_date(date_to, end_of_day=True) if date_to else None
-
         if start_dt and hasattr(Scan, "created_at"):
             q = q.filter(Scan.created_at >= start_dt)
         if end_dt and hasattr(Scan, "created_at"):
