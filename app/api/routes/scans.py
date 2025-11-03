@@ -16,6 +16,10 @@ from app.db import SessionLocal
 from app.models.scan import Scan
 from app.services.scan_pipeline import create_scan_from_text  # ⬅️ pipeline
 
+from sqlalchemy import func
+from app.models.feedback import Feedback, VALID_LABELS
+
+
 logger = get_logger(__name__)
 router = APIRouter(tags=["api"])  # groups these under "api" in Swagger
 
@@ -121,32 +125,89 @@ def list_scans(
     db: Session = Depends(get_db),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    label: Optional[Literal["safe", "spam", "phishing"]] = Query(default=None),
+    sender: Optional[str] = Query(default=None, description="Exact sender match"),
+    domain: Optional[str] = Query(default=None, description="Sender domain (e.g., example.com)"),
+    date_from: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
 ):
     try:
-        total = db.query(Scan).count()
+        q = db.query(Scan)
+
+        if label:
+            q = q.filter(Scan.label == label)
+        if sender:
+            q = q.filter(Scan.sender == sender)
+        if domain:
+            # right-of-@ domain match (sqlite/postgres friendly)
+            q = q.filter(func.substr(Scan.sender, func.instr(Scan.sender, "@") + 1) == domain)
+
+        if date_from:
+            start_dt = _parse_date(date_from)
+            if hasattr(Scan, "created_at"):
+                q = q.filter(Scan.created_at >= start_dt)
+        if date_to:
+            end_dt = _parse_date(date_to, end_of_day=True)
+            if hasattr(Scan, "created_at"):
+                q = q.filter(Scan.created_at <= end_dt)
+
+        total = q.count()
         page = max(1, page)
         pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, pages)
 
         rows: List[Scan] = (
-            db.query(Scan)
-            .order_by(Scan.id.desc())
+            q.order_by(Scan.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
             .all()
         )
         items = [_scan_to_payload(s) for s in rows]
-        return {
-            "items": items,
-            "total": total,
-            "page": page,
-            "pages": pages,
-            "page_size": page_size,
-        }
+        return {"items": items, "total": total, "page": page, "pages": pages, "page_size": page_size}
+    
     except Exception as e:
         logger.exception("list_scans failed: %s", e)
         return JSONResponse(
             {"error": "Internal Server Error", "message": "Failed to list scans."},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        
+        
+    
+class FeedbackCreate(BaseModel):
+    user_label: Literal["safe", "spam", "phishing"]
+    notes: Optional[str] = None
+    source: Optional[str] = "api"
+
+@router.post("/api/scan/{scan_id}/feedback", status_code=status.HTTP_201_CREATED)
+def add_feedback(
+    scan_id: int,
+    payload: FeedbackCreate,
+    db: Session = Depends(get_db),
+):
+    try:
+        scan = db.get(Scan, scan_id)
+        if not scan:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+
+        fb = Feedback(
+            scan_id=scan_id,
+            user_label=payload.user_label,
+            notes=payload.notes,
+            source=payload.source or "api",
+        )
+        db.add(fb)
+        db.commit()
+        db.refresh(fb)
+
+        logger.info("feedback added scan_id=%s user_label=%s", scan_id, payload.user_label)
+        return {"ok": True, "feedback_id": fb.id, "scan_id": scan_id, "user_label": fb.user_label}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("add_feedback failed: %s", e)
+        return JSONResponse(
+            {"error": "Internal Server Error", "message": "Failed to save feedback."},
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
@@ -187,22 +248,20 @@ def export_csv(
     label: Optional[Literal["safe", "spam", "phishing"]] = Query(default=None),
     date_from: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    sender: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
 ):
-    """
-    Stream a CSV of scans.
-    Filters:
-      - label: safe|spam|phishing
-      - date_from/date_to: YYYY-MM-DD (inclusive)
-    """
     try:
         q = db.query(Scan)
-
         if label:
             q = q.filter(Scan.label == label)
+        if sender:
+            q = q.filter(Scan.sender == sender)
+        if domain:
+            q = q.filter(func.substr(Scan.sender, func.instr(Scan.sender, "@") + 1) == domain)
 
         start_dt = _parse_date(date_from) if date_from else None
         end_dt = _parse_date(date_to, end_of_day=True) if date_to else None
-
         if start_dt and hasattr(Scan, "created_at"):
             q = q.filter(Scan.created_at >= start_dt)
         if end_dt and hasattr(Scan, "created_at"):
