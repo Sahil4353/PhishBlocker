@@ -330,6 +330,16 @@ def build_rows(
     ctr = Counters(ctype_counter=Counter())
     sampled: List[Path] = []
 
+    logger.info(
+        "[%s] build_rows start: label=%s min_chars=%d max_candidates=%d size_max_bytes=%d progress_every=%d",
+        source,
+        label,
+        min_chars,
+        max_candidates,
+        size_max_bytes,
+        progress_every,
+    )
+
     for p in paths:
         ctr.files_seen += 1
 
@@ -499,7 +509,10 @@ def main() -> int:
     # SpamAssassin
     sa_rows: List[dict] = []
     sa_ctr_total = Counters(ctype_counter=Counter())
+    logger.info("[spamassassin] root=%s", args.spamassassin_root)
+
     for paths, lbl in spamassassin_sets(args.spamassassin_root):
+        logger.info("[spamassassin] processing set label=%s", lbl)
         rows, ctr = build_rows(
             paths,
             label=lbl,
@@ -508,6 +521,9 @@ def main() -> int:
             min_chars=args.min_chars,
             debug_sample=(args.debug_sample if args.debug else 0),
             ctype_sample=(args.ctype_sample if args.debug else 0),
+            max_candidates=args.max_candidates_per_source,
+            size_max_bytes=args.size_max_bytes,
+            progress_every=args.progress_every,
         )
         sa_rows.extend(rows)
         for field in (
@@ -527,6 +543,7 @@ def main() -> int:
     pd.DataFrame(sa_rows).to_csv(out_dir / "spamassassin.csv", index=False)
 
     # Nazario (all phishing)
+    logger.info("[nazario] root=%s", args.nazario_root)
     naz_rows, naz_ctr = build_rows(
         iter_message_files(args.nazario_root),
         label="phishing",
@@ -535,10 +552,14 @@ def main() -> int:
         min_chars=args.min_chars,
         debug_sample=(args.debug_sample if args.debug else 0),
         ctype_sample=(args.ctype_sample if args.debug else 0),
+        max_candidates=args.max_candidates_per_source,
+        size_max_bytes=args.size_max_bytes,
+        progress_every=args.progress_every,
     )
     pd.DataFrame(naz_rows).to_csv(out_dir / "nazario.csv", index=False)
 
     # Enron maildir (safe)
+    logger.info("[enron] maildir=%s", args.enron_maildir)
     enron_rows, enron_ctr = build_rows(
         iter_message_files(args.enron_maildir),
         label="safe",
@@ -547,7 +568,11 @@ def main() -> int:
         min_chars=args.min_chars,
         debug_sample=(args.debug_sample if args.debug else 0),
         ctype_sample=(args.ctype_sample if args.debug else 0),
+        max_candidates=args.max_candidates_per_source,
+        size_max_bytes=args.size_max_bytes,
+        progress_every=args.progress_every,
     )
+
     pd.DataFrame(enron_rows).to_csv(out_dir / "enron.csv", index=False)
 
     # Summaries

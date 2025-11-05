@@ -34,7 +34,7 @@ function Show-Tree {
 
     # Show a couple of files in this directory
     $files = Get-ChildItem $fullPath -File -ErrorAction SilentlyContinue |
-             Select-Object -First $MaxFilesPerDir
+    Select-Object -First $MaxFilesPerDir
 
     foreach ($f in $files) {
         Write-Host "$indent- $($f.Name)"
@@ -57,3 +57,26 @@ function Show-Tree {
 }
 
 Show-Tree
+
+# Replace with a suspect folder you saw, e.g. the allen-p folder
+$folder = ".\data\raw\enron\maildir\allen-p\all_documents"
+if (-not (Test-Path $folder)) { Write-Host "Folder not found: $folder"; exit }
+
+# Show first 20 files with size and LastWriteTime
+Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue |
+Sort-Object Length -Descending |
+Select-Object -First 20 FullName, Length, LastWriteTime |
+Format-Table -AutoSize
+
+$folder = ".\data\raw\enron\maildir\allen-p\all_documents"
+$sample = Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+
+$sample.FullName
+
+$path = $sample.FullName
+$extPath = "\\?\$path"   # extended-length path that preserves trailing dot
+
+Get-Content -LiteralPath $extPath -TotalCount 40
+
+    
