@@ -1,4 +1,4 @@
-Perfect—here’s a single, clean, **updated TODO / roadmap** that keeps everything you’ve already written, plus what we actually finished, and exactly what we still need to do next (with the Git flow you asked for).
+Absolutely—here’s your **updated, single TODO / roadmap** reflecting what we actually finished today (Windows-safe normalization, logging/progress knobs, dedupe script + PR), plus exactly what’s next with the **Git flow and run commands** you asked for.
 
 ---
 
@@ -8,16 +8,16 @@ Perfect—here’s a single, clean, **updated TODO / roadmap** that keeps everyt
 
 ### App / APIs / Infra
 
-* FastAPI app with `create_app()` factory, async `lifespan`, and Request-ID middleware.
+* FastAPI app with `create_app()` factory, async `lifespan`, Request-ID middleware.
 * Routers
 
   * **pages (HTML):** `/`, `POST /scan`, `/history`, `/scan/{id}/view` (end-to-end form → pipeline → DB → detail view).
   * **scans (JSON/exports):** `POST /api/scan`, `GET /api/scans`, `GET /api/scan/{id}`, `GET /export/csv` (Excel formula hardening).
   * **debug:** `/health`, `/_debug/scan_count`, `/_debug/cwd`.
-* Central logging & config: env-driven log level, Request-ID injected into all logs (also `uvicorn.*`), structured startup logs.
+* Central logging & config: env-driven log level, Request-ID injected into all logs (incl. `uvicorn.*`), structured startup logs.
 * App config (`app/core/config.py`): `ENV`, logging toggles, `MODEL_PATH`, `MODEL_VERSION`, `MODEL_METRICS_PATH`.
 * Runtime model loading: `ModelService` instantiated once; graceful fallback to heuristics if artifact missing; attached to `app.state.model`.
-* Database: SQLAlchemy `Email` & `Scan` models (FKs, indexes). `Scan` persists `label`, `confidence`, human-readable `reasons`, structured `details` (tokens/weights), full `probs` map, `header_flags`, `model_version`, `created_at`.
+* Database: SQLAlchemy `Email` & `Scan` models (FKs, indexes). `Scan` persists `label`, `confidence`, human-readable `reasons`, structured `details` (tokens/weights), full `probs`, `header_flags`, `model_version`, `created_at`.
 * Dev DB bootstraps via `Base.metadata.create_all()`; prod path assumes Alembic.
 * CSV export with label/date filters and safe output.
 
@@ -29,7 +29,7 @@ Perfect—here’s a single, clean, **updated TODO / roadmap** that keeps everyt
 
 ### Model service
 
-* `app/services/model.py`: loads joblib pipeline, exposes:
+* `app/services/model.py` with:
 
   * `predict_with_explanations(text, meta) -> (label, prob, reasons[])`
   * `predict_proba_map(text) -> {class: prob, ...}`
@@ -37,246 +37,216 @@ Perfect—here’s a single, clean, **updated TODO / roadmap** that keeps everyt
 
 ### Trainer & tooling
 
-* `scripts/train_baseline.py` (GPU/CPU-friendly TF-IDF + Torch LR):
-
-  * resilient IO, label normalization, metrics JSON, PR/ROC and CM plots, optional temperature scaling, threshold tuning helpers.
+* `scripts/train_baseline.py` (GPU/CPU-friendly TF-IDF + Torch LR): resilient IO, label normalization, metrics JSON, PR/ROC/CM plots, optional temperature scaling, threshold tuning helpers.
 * Predictor script exists; artifacts and datasets are **gitignored** and documented.
+
+### Datasets & ETL (new today)
+
+* **PowerShell downloaders added** (`scripts/datasets/fetch_spamassassin.ps1`, `fetch_nazario.ps1`, `fetch_enron.ps1`) — idempotent, resume-friendly.
+* **Normalization script implemented & hardened**: `scripts/datasets/normalize_eml.py`
+
+  * Windows-safe traversal of Enron (uses `os.walk` with `\\?\` extended paths; handles trailing-dot filenames).
+  * Bytes/str-safe email extraction; HTML fallbacks; minimal cleaner.
+  * **Debug & telemetry** flags: `--debug`, `--debug-sample`, `--ctype-sample`, `--max-candidates-per-source`, `--size-max-bytes`, `--progress-every`.
+* **Exact dedupe implemented**: `scripts/datasets/dedupe_texts.py`
+
+  * SHA-256 of normalized text (casefold + whitespace collapse); keep first per `(text,label)`.
+  * Logs totals and by-label counts.
+* **Active branch:** `feat/data-dedupe` (PR opened).
 
 ### Local smoke
 
 * App runs on Windows with `uvicorn` (8080); `/`, `/history`, `/api/*` verified.
-* Branch hygiene in place; you’ve been committing small steps.
+* Branch hygiene in place; committing in small steps.
 
 ---
 
 ## In progress 🚧
 
-* **Threshold audit & persistence in pipeline** (branch `feat/ml-threshold-audit`)—initial wiring committed.
-* **Dataset acquisition**: Nazario download working; SpamAssassin cmd fixed (new URL set); Enron download plan finalized.
+* **Normalization full run** on Enron (now works; very large). Using new knobs to verify on samples, then scale.
+* **Dedupe** to produce `mix_dedup.csv` after normalization outputs are ready.
 
 ---
 
 ## Next up (M2 — Data & thresholds) 🎯
 
-Below are bite-sized tasks, each with a **branch name** and **git commands** you can run. I’ve also listed which files I’ll need from you (when relevant) so we can review code after you push.
+Below are bite-sized tasks with **branch names**, **git commands**, and **run commands**.
 
-### 1) Project layout refactor for scripts
+### 1) (If not merged) Land normalization fixes
 
-**Goal:** split huge trainer into modules; add a clean ETL area for dataset transforms.
+**Branch:** `feat/data-normalize` (use if you want a separate PR for normalize changes)
 
-* **Branch:** `feat/scripts-refactor`
-* **What to do**
+```powershell
+git switch -c feat/data-normalize
+git add scripts/datasets/normalize_eml.py
+git commit -m "feat(datasets): Windows-safe Enron traversal + debug/progress flags"
+git push -u origin feat/data-normalize
+gh pr create --base main --head feat/data-normalize `
+  --title "Datasets: normalization (Windows-safe Enron + progress/limits)" `
+  --body  "Use os.walk + \\?\\; add debug/progress/limits; robust extraction."
+```
 
-  * Create folders:
+**Quick sample run (fast verification):**
 
-    ```
-    scripts/
-      datasets/        # converters, cleaners, dedupe, balance
-      train/           # training entrypoints
-      utils/           # common IO, logging, text cleaning
-    ```
-  * Move `scripts/train_baseline.py` → `scripts/train/train_baseline.py`
-  * Add stubs:
+```powershell
+python scripts/datasets/normalize_eml.py `
+  --spamassassin-root data/raw/spamassassin `
+  --nazario-root      data/raw/nazario `
+  --enron-maildir     data/raw/enron/maildir `
+  --min-chars 5 `
+  --out-dir           data/processed `
+  --debug --ctype-sample 0 --debug-sample 3 `
+  --max-candidates-per-source 5000 `
+  --size-max-bytes 2000000 `
+  --progress-every 2000
+```
 
-    * `scripts/utils/io.py` (safe CSV/Parquet reader/writer)
-    * `scripts/utils/text.py` (normalize whitespace, strip quotes/sigs placeholders)
-    * `scripts/datasets/normalize_eml.py` (RFC822/mbox → rows)
-    * `scripts/datasets/dedupe_texts.py` (hash + near-dup hooks)
-    * `scripts/datasets/balance_split.py` (class balancing, train/val split)
-* **Git**
+**Full run (later, no cap):**
 
-  ```
-  git checkout -b feat/scripts-refactor
-  git mv scripts/train_baseline.py scripts/train/train_baseline.py
-  git add scripts/utils/io.py scripts/utils/text.py scripts/datasets/normalize_eml.py scripts/datasets/dedupe_texts.py scripts/datasets/balance_split.py
-  git commit -m "refactor(scripts): split trainer and scaffold ETL modules (io, text, normalize_eml, dedupe, balance)"
-  git push -u origin feat/scripts-refactor
-  ```
-* **Files I’ll review after you push:** the new module stubs and the updated trainer import paths.
-
----
-
-### 2) Dataset downloads (repeatable, scripted)
-
-**Goal:** PowerShell scripts you can re-run to fetch/refresh datasets.
-
-* **Branch:** `feat/data-downloaders`
-* **What to do**
-
-  * Add PS scripts:
-
-    * `scripts/datasets/fetch_spamassassin.ps1`
-    * `scripts/datasets/fetch_nazario.ps1`
-    * `scripts/datasets/fetch_enron.ps1`
-  * Each creates `data/raw/<source>` and downloads/extracts defensively.
-* **Git**
-
-  ```
-  git checkout -b feat/data-downloaders
-  git add scripts/datasets/fetch_spamassassin.ps1 scripts/datasets/fetch_nazario.ps1 scripts/datasets/fetch_enron.ps1
-  git commit -m "feat(datasets): PowerShell downloaders for SpamAssassin, Nazario, and Enron (idempotent)"
-  git push -u origin feat/data-downloaders
-  ```
-* **Files I’ll review:** those `.ps1` scripts.
+```powershell
+python scripts/datasets/normalize_eml.py `
+  --spamassassin-root data/raw/spamassassin `
+  --nazario-root      data/raw/nazario `
+  --enron-maildir     data/raw/enron/maildir `
+  --min-chars 20 `
+  --out-dir           data/processed `
+  --progress-every 20000
+```
 
 ---
 
-### 3) Normalization: EML/MBOX → canonical CSV
+### 2) De-duplication (exact)
 
-**Goal:** produce `data/processed/<source>.csv` with **two columns**: `body_text`, `label` (one of `safe|spam|phishing`).
+**Branch:** `feat/data-dedupe` (already created & pushed)
 
-* **Branch:** `feat/data-normalize`
-* **What to do**
+**Run after normalize CSVs exist:**
 
-  * Implement `scripts/datasets/normalize_eml.py`:
+```powershell
+python scripts/datasets/dedupe_texts.py `
+  --inputs data/processed/spamassassin.csv data/processed/nazario.csv data/processed/enron.csv `
+  --out    data/processed/mix_dedup.csv
+```
 
-    * Walk:
+**If you tweak the script, commit small:**
 
-      * SpamAssassin dirs (`easy_ham*`→`safe`, `spam*`→`spam`)
-      * Nazario files (`phishing`)
-      * Enron maildir (`safe`)
-    * Use **your existing** `app/services/parser.py` logic (you can import it) to extract `body_text`.
-    * Drop empties and extremely short texts (e.g., `< 20 chars`).
-    * Save per-source CSVs to `data/processed/`.
-* **Git**
-
-  ```
-  git checkout -b feat/data-normalize
-  git add scripts/datasets/normalize_eml.py
-  git commit -m "feat(datasets): normalize EML/maildir to canonical CSV {body_text,label} per source"
-  git push -u origin feat/data-normalize
-  ```
-* **Files I’ll review:** the `normalize_eml.py` implementation.
+```powershell
+git add scripts/datasets/dedupe_texts.py
+git commit -m "chore(dedupe): tweak logging & edge-cases"
+git push
+# PR already exists; push updates to same branch
+```
 
 ---
 
-### 4) De-duplication (exact + near-dup hooks)
-
-**Goal:** remove exact dupes and prep for near-dup removal without heavy deps (for now).
-
-* **Branch:** `feat/data-dedupe`
-* **What to do**
-
-  * Implement `scripts/datasets/dedupe_texts.py`:
-
-    * Exact dupes: SHA256 on normalized text (lowercase, collapse whitespace).
-    * Keep first occurrence per (text,label); log counts removed.
-    * Leave hooks (functions) for optional near-dup (e.g., MinHash/SimHash) later.
-* **Git**
-
-  ```
-  git checkout -b feat/data-dedupe
-  git add scripts/datasets/dedupe_texts.py
-  git commit -m "feat(datasets): exact dedupe by text hash; hooks for near-dup"
-  git push -u origin feat/data-dedupe
-  ```
-* **Files I’ll review:** the dedupe script.
-
----
-
-### 5) Balancing to target counts (≥100k per class)
+### 3) Balancing to target counts (≥100k/class)
 
 **Goal:** produce a single balanced dataset with **100k per class** minimum (`safe`, `spam`, `phishing`).
 
-* **Branch:** `feat/data-balance-100k`
-* **What to do**
+**Branch:** `feat/data-balance-100k`
 
-  * Implement `scripts/datasets/balance_split.py`:
+**What to implement:** `scripts/datasets/balance_split.py`
 
-    * Load normalized + deduped CSVs.
-    * Compute available counts per class.
-    * Strategy:
+* Load normalized + deduped CSVs.
+* Count available per class.
+* Strategy:
 
-      * **safe:** downsample from Enron to target.
-      * **spam:** combine SpamAssassin (all spam sets) + any other spam we add later; if short, reuse with **different seeds** (augment by light transforms only if needed—e.g., whitespace jitter—otherwise document shortfall).
-      * **phishing:** Nazario is small; we’ll need to add more phishing sources (coming in M2.1). For now, parameterize `--target-per-class 100000` and **warn** if not met; still produce the max feasible balanced set.
-    * Output:
+  * **safe:** downsample Enron to target.
+  * **spam:** all SpamAssassin spam sets; if short, document shortfall (allow param `--target-per-class`, warn when unmet).
+  * **phishing:** Nazario is small; still produce max feasible balanced set and warn.
+* Output:
 
-      * `data/processed/mix_balanced.csv` and `mix_balanced.parquet`
-      * deterministic `train/val` split (e.g., 80/20).
-* **Git**
+  * `data/processed/mix_balanced.csv`, `mix_balanced.parquet`
+  * Deterministic `train/val` (e.g., 80/20) using seeded split.
 
-  ```
-  git checkout -b feat/data-balance-100k
-  git add scripts/datasets/balance_split.py
-  git commit -m "feat(datasets): balance + split pipeline targeting 100k/class; warns when sources underfill"
-  git push -u origin feat/data-balance-100k
-  ```
-* **Files I’ll review:** the balancing script.
+**Git flow:**
 
----
-
-### 6) Metrics & thresholds loader at runtime
-
-**Goal:** load `*.metrics.json` and apply per-class thresholds in inference.
-
-* **Branch:** `feat/ml-threshold-runtime`
-* **What to do**
-
-  * Add `app/services/thresholds.py`:
-
-    * Read `settings.MODEL_METRICS_PATH`.
-    * Provide `get_thresholds()` and `decide_label(probs, thresholds)` (e.g., `if probs['phishing']≥τ_p -> 'phishing'; elif probs['spam']≥τ_s -> 'spam'; else 'safe'`).
-  * Update `scan_pipeline.py` to:
-
-    * Use **threshold decision** when `model` exists (store the chosen τ values in `Scan.details` under `thresholds_used`).
-* **Git**
-
-  ```
-  git checkout -b feat/ml-threshold-runtime
-  git add app/services/thresholds.py
-  git commit -m "feat(ml): load thresholds from metrics.json and apply decision policy in pipeline"
-  git add app/services/scan_pipeline.py
-  git commit -m "chore(pipeline): persist thresholds_used and final_decision_source"
-  git push -u origin feat/ml-threshold-runtime
-  ```
-* **Files I’ll review:** `thresholds.py`, pipeline changes.
+```powershell
+git switch -c feat/data-balance-100k
+git add scripts/datasets/balance_split.py
+git commit -m "feat(datasets): balance+split targeting 100k/class; warn when sources underfill"
+git push -u origin feat/data-balance-100k
+gh pr create --base main --head feat/data-balance-100k `
+  --title "Datasets: balance + split (target 100k/class)" `
+  --body  "Downsample safe; combine spam; parameterized target with warnings; outputs CSV+Parquet and train/val split."
+```
 
 ---
 
-### 7) UI/UX: surface operating point
+### 4) Metrics & thresholds loader at runtime
 
-**Goal:** show users the current threshold policy and confidence.
+**Branch:** `feat/ml-threshold-runtime`
 
-* **Branch:** `feat/ui-threshold-indicator`
-* **What to do**
+**Implement:**
 
-  * On `/scan/{id}/view`, display:
+* `app/services/thresholds.py`
 
-    * Final label & confidence,
-    * Threshold used for that class (e.g., “τ_phishing = 0.72”),
-    * Top tokens (already available in `Scan.details`).
-* **Git**
+  * read `settings.MODEL_METRICS_PATH`
+  * `get_thresholds()` and `decide_label(probs, thresholds)` (e.g., `τ_phishing`, `τ_spam`; else safe).
+* Update `scan_pipeline.py`
 
-  ```
-  git checkout -b feat/ui-threshold-indicator
-  # update template(s): app/api/routes/pages.py + Jinja templates
-  git add <updated templates and route>
-  git commit -m "feat(ui): show threshold policy & top tokens on scan detail"
-  git push -u origin feat/ui-threshold-indicator
-  ```
-* **Files I’ll review:** updated page template/route.
+  * use threshold policy when model exists,
+  * persist `thresholds_used` + `final_decision_source` in `Scan.details`.
+
+**Git flow:**
+
+```powershell
+git switch -c feat/ml-threshold-runtime
+git add app/services/thresholds.py
+git commit -m "feat(ml): load thresholds from metrics.json and provide decision policy"
+git add app/services/scan_pipeline.py
+git commit -m "chore(pipeline): apply threshold policy; persist thresholds_used and decision_source"
+git push -u origin feat/ml-threshold-runtime
+gh pr create --base main --head feat/ml-threshold-runtime `
+  --title "ML: runtime thresholds + decision policy" `
+  --body  "Load τ from metrics; apply class thresholds; store in Scan.details."
+```
 
 ---
 
-### 8) Filtering & feedback (kickoff)
+### 5) UI/UX: surface operating point
 
-**Goal:** basic filters + feedback capture for future retraining.
+**Branch:** `feat/ui-threshold-indicator`
 
-* **Branch:** `feat/history-filters-feedback`
-* **What to do**
+**Implement on `/scan/{id}/view`:**
 
-  * Add query params to `/history` and `/api/scans` (label/sender/date).
-  * On detail page, add simple “Correct label to: …” (stores a correction row; schema TBD).
-* **Git**
+* Final label & confidence
+* Threshold used for that class (e.g., “τ_phishing = 0.72”)
+* Top tokens (already in `Scan.details`)
 
-  ```
-  git checkout -b feat/history-filters-feedback
-  git add app/api/routes/scans.py app/api/routes/pages.py app/models/<corrections>.py
-  git commit -m "feat(history): filters for label/sender/date and basic feedback capture"
-  git push -u origin feat/history-filters-feedback
-  ```
-* **Files I’ll review:** route changes and minimal model for feedback.
+**Git flow:**
+
+```powershell
+git switch -c feat/ui-threshold-indicator
+git add app/api/routes/pages.py app/templates/<updated>.html
+git commit -m "feat(ui): show threshold policy, class confidence, and top tokens on scan detail"
+git push -u origin feat/ui-threshold-indicator
+gh pr create --base main --head feat/ui-threshold-indicator `
+  --title "UI: threshold indicator on scan detail" `
+  --body  "Expose τ per class, final confidence, and token explanations."
+```
+
+---
+
+### 6) Filtering & feedback (kickoff)
+
+**Branch:** `feat/history-filters-feedback`
+
+**Implement:**
+
+* Query params on `/history` and `/api/scans` (label/sender/date).
+* Basic “Correct label to …” on detail page → persist minimal `Correction` model (schema TBD).
+
+**Git flow:**
+
+```powershell
+git switch -c feat/history-filters-feedback
+git add app/api/routes/scans.py app/api/routes/pages.py app/models/corrections.py
+git commit -m "feat(history): filters for label/sender/date and basic feedback capture"
+git push -u origin feat/history-filters-feedback
+gh pr create --base main --head feat/history-filters-feedback `
+  --title "History: filters + feedback capture (kickoff)" `
+  --body  "Adds query filters and a simple correction model for future retraining."
+```
 
 ---
 
@@ -284,13 +254,24 @@ Below are bite-sized tasks, each with a **branch name** and **git commands** you
 
 * CI: pre-commit (black/ruff/isort), pytest seeds (parser & API), GitHub Actions (lint+test), Dockerfile + Alembic on start.
 * Data retention: TTL job to redact `Email.body_text/html_raw` after N days; keep `Scan` metadata.
-* Near-duplicate removal: MinHash/SimHash optional module when we scale up phishing sources.
+* Near-duplicate removal: MinHash/SimHash optional module when phishing sources scale.
 
 ---
 
 ## Running order (recommended)
 
-1. `feat/scripts-refactor` → 2) `feat/data-downloaders` → 3) `feat/data-normalize` → 4) `feat/data-dedupe` → 5) `feat/data-balance-100k` → 6) `feat/ml-threshold-runtime` → 7) `feat/ui-threshold-indicator` → 8) `feat/history-filters-feedback`.
+1. `feat/scripts-refactor`
+2. `feat/data-downloaders`
+3. `feat/data-normalize` (✅ implemented; finalize full run)
+4. `feat/data-dedupe` (✅ script + PR; run after normalize outputs)
+5. `feat/data-balance-100k`
+6. `feat/ml-threshold-runtime`
+7. `feat/ui-threshold-indicator`
+8. `feat/history-filters-feedback`
 
-I’ll review each branch as you push the files I listed.
-When you’re ready to start the **downloads**, run the PowerShell scripts we prepared, then we’ll wire up **normalize → dedupe → balance** and move on to thresholds.
+Ping me with:
+
+* The **normalize** summary lines (per source) for your sample or full run, and
+* The **dedupe** totals,
+
+…and I’ll hand you the `balance_split.py` scaffold and exact commands to land it.
