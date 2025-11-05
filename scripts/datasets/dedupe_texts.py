@@ -63,11 +63,14 @@ def main() -> int:
     all_df["__norm"] = all_df["body_text"].astype(str).map(normalize_text)
     all_df["__hash"] = all_df["__norm"].map(sha256_hex)
 
+    # Stats before
+    total_in = len(all_df)
+    by_label_before = all_df["label"].value_counts().sort_index()
+
     # Drop exact duplicates per (hash, label) keeping first occurrence
-    before = len(all_df)
     all_df = all_df.drop_duplicates(subset=["__hash", "label"], keep="first")
-    after = len(all_df)
-    removed = before - after
+    total_out = len(all_df)
+    removed = total_in - total_out
 
     # Optional: keep a quick length for downstream sanity (unchanged if present)
     if "len_chars" not in all_df.columns:
@@ -93,10 +96,11 @@ def main() -> int:
     out_df.to_csv(args.out, index=False)
 
     # Report
-    by_label_in = pd.Series(dfs[0].columns)  # dummy to silence pyright; not used
     print(f"Total in:     {total_in}")
-    print(f"Total unique: {after}")
+    print(f"Total unique: {total_out}")
     print(f"Removed dups: {removed}")
+    print("By label (pre-dedupe):")
+    print(by_label_before)
     print("By label (post-dedupe):")
     print(out_df["label"].value_counts().sort_index())
 
