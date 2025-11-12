@@ -47,8 +47,8 @@ import matplotlib.pyplot as plt
 log = logging.getLogger("train_baseline")
 
 # --- Windows-safe globals for CSR collation (top-level so workers can pickle) ---
-_GLOBAL_X_CSR = None
-_GLOBAL_Y_NP = None
+_GLOBAL_X_CSR: Optional[csr_matrix] = None
+_GLOBAL_Y_NP: Optional[np.ndarray] = None
 
 
 # ------------------------- logging -------------------------
@@ -65,7 +65,15 @@ def setup_logging(level: str = "INFO") -> None:
 def csr_worker_init(worker_id: int):
     """Runs in each worker; capture dataset's CSR pointers into globals."""
     info = torch.utils.data.get_worker_info()
-    ds = info.dataset  # our IndexCSRDataset
+    # In the main process this can be None, but as a worker_init_fn it should be set.
+    if info is None:
+        return
+
+    ds = info.dataset
+    # Help the type checker: we know this is always IndexCSRDataset here.
+    if not isinstance(ds, IndexCSRDataset):
+        raise TypeError("csr_worker_init expects an IndexCSRDataset")
+
     global _GLOBAL_X_CSR, _GLOBAL_Y_NP
     _GLOBAL_X_CSR = ds.X
     _GLOBAL_Y_NP = ds.y
@@ -73,8 +81,13 @@ def csr_worker_init(worker_id: int):
 
 def collate_csr_indices(batch_indices):
     """Vectorized CSR -> dense for a whole batch, using globals set in worker_init."""
+    if _GLOBAL_X_CSR is None or _GLOBAL_Y_NP is None:
+        raise RuntimeError("CSR globals not initialised; did csr_worker_init run?")
+
     idx = np.fromiter(batch_indices, dtype=np.int64)
-    xb = torch.from_numpy(_GLOBAL_X_CSR[idx].toarray().astype(np.float32, copy=False))
+    xb = torch.from_numpy(
+        _GLOBAL_X_CSR[idx].toarray().astype(np.float32, copy=False)
+    )
     yb = torch.from_numpy(_GLOBAL_Y_NP[idx])
     return xb, yb
 
@@ -203,10 +216,11 @@ def make_loaders(
         weights = 1.0 / np.clip(binc, 1, None)
         sample_w = weights[y_tr]
         sampler = WeightedRandomSampler(
-            torch.from_numpy(sample_w).double(),
+            sample_w.tolist(),
             num_samples=len(sample_w),
             replacement=True,
-        )
+    )
+
         tr_loader = DataLoader(
             ds_tr,
             batch_size=args.batch_size,
@@ -234,7 +248,7 @@ def make_loaders(
 def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
     """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
@@ -419,16 +433,16 @@ def make_loaders_from_csr(X_tr, y_tr, X_te, y_te, num_classes: int, args, device
         weights = 1.0 / np.clip(binc, 1, None)
         sample_w = weights[y_tr]
         sampler = WeightedRandomSampler(
-            torch.from_numpy(sample_w).double(),
+            sample_w.tolist(),
             num_samples=len(sample_w),
             replacement=True,
-        )
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            **{k: v for k, v in common.items() if v is not None},
-        )
+    )
+    tr_loader = DataLoader(
+        ds_tr,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        **{k: v for k, v in common.items() if v is not None},
+    )
     else:
         tr_loader = DataLoader(
             ds_tr,
@@ -474,8 +488,24 @@ def run(args: argparse.Namespace) -> int:
     num_classes = len(classes)
     log.info("Classes: %s", classes)
 
+    # --- Guard: stratified split fails if any class has < 2 samples ---
+    min_count = min(class_counts.values())
+    if min_count < 2:
+        log.warning(
+            "Some classes have <2 samples (%s). Disabling stratified split. "
+            "Consider using --binary or collecting more data for those classes.",
+            class_counts,
+        )
+        stratify_y = None
+    else:
+        stratify_y = y
+
     X_tr_text, X_te_text, y_tr, y_te = train_test_split(
-        X_text, y, test_size=args.val_size, random_state=args.seed, stratify=y
+        X_text,
+        y,
+        test_size=args.val_size,
+        random_state=args.seed,
+        stratify=stratify_y,
     )
 
     # --- TF-IDF stacks ---
@@ -513,7 +543,9 @@ def run(args: argparse.Namespace) -> int:
         X_tr, X_te = Xw_tr, Xw_te
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Device: %s | AMP: %s", device, args.mixed_precision)
+    use_amp = args.mixed_precision and device.type == "cuda"
+    log.info("Device: %s | AMP: %s", device, use_amp)
+
 
     # Datasets / Loaders (multiclass; batch CSR->dense for speed)
     tr_loader, te_loader = make_loaders_from_csr(
@@ -573,14 +605,15 @@ def run(args: argparse.Namespace) -> int:
     )
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(
-            model,
-            tr_loader,
-            optimizer,
-            criterion,
-            device,
-            args.mixed_precision,
-            args.accum_steps,
-        )
+        model,
+        tr_loader,
+        optimizer,
+        criterion,
+        device,
+        use_amp,
+        args.accum_steps,
+    )
+
 
         # quick val metric focusing on recall
         score = _val_recallish_score(model)
@@ -639,27 +672,29 @@ def run(args: argparse.Namespace) -> int:
         roc_curve_png = out_dir / "roc_curve.png"
         plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
-    # Compute standard metrics (post-threshold for binary if selected)
-    # ---- Compute standard metrics (no local imports; avoids UnboundLocalError) ----
-
+        # ---- Compute standard metrics (post-threshold for binary if selected) ----
     if getattr(args, "binary", False) and tuned_threshold is not None:
+        # Binary safe vs not_safe using tuned threshold
         pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
         y_true_bin = (y_val == pos_idx).astype(int)
         y_pred_bin = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
 
         report = classification_report(
-            y_true_bin, y_pred_bin, target_names=["safe", "not_safe"], output_dict=True
+            y_true_bin,
+            y_pred_bin,
+            target_names=["safe", "not_safe"],
+            output_dict=True,
         )
         cm = confusion_matrix(y_true_bin, y_pred_bin).tolist()
         acc = float((y_pred_bin == y_true_bin).mean())
     else:
+        # Multiclass, or binary without a tuned threshold: use argmax
         y_pred = probs_val.argmax(axis=1)
         report = classification_report(
             y_val, y_pred, target_names=classes, output_dict=True
         )
-    cm = confusion_matrix(y_val, y_pred).tolist()
-    acc = float((y_pred == y_val).mean())
-
+        cm = confusion_matrix(y_val, y_pred).tolist()
+        acc = float((y_pred == y_val).mean())
     log.info("[✓] Final val_acc=%.4f", acc)
 
     # ---- Save artifacts ----
@@ -696,9 +731,9 @@ def run(args: argparse.Namespace) -> int:
         "torch_version": torch.__version__,
         "cuda": getattr(torch.version, "cuda", None),
         "device": str(device),
-        "classes": classes
-        if not getattr(args, "binary", False)
-        else ["safe", "not_safe"],
+        "classes": (
+            classes if not getattr(args, "binary", False) else ["safe", "not_safe"]
+        ),
         "class_distribution": class_counts,
         "accuracy": acc,
         "report": report,
