@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import joblib
 import matplotlib
@@ -71,7 +71,8 @@ def csr_worker_init(worker_id: int):
 
     ds = info.dataset
     # Help the type checker: we know this is always IndexCSRDataset here.
-    if not isinstance(ds, IndexCSRDataset):
+    if not isinstance(ds, "IndexCSRDataset") and not isinstance(ds, IndexCSRDataset):
+        # isinstance with string is ignored at runtime; the second check is the real one.
         raise TypeError("csr_worker_init expects an IndexCSRDataset")
 
     global _GLOBAL_X_CSR, _GLOBAL_Y_NP
@@ -80,15 +81,21 @@ def csr_worker_init(worker_id: int):
 
 
 def collate_csr_indices(batch_indices):
-    """Vectorized CSR -> dense for a whole batch, using globals set in worker_init."""
+    """Vectorized CSR -> dense using globals set in worker_init."""
+    global _GLOBAL_X_CSR, _GLOBAL_Y_NP
+
     if _GLOBAL_X_CSR is None or _GLOBAL_Y_NP is None:
-        raise RuntimeError("CSR globals not initialised; did csr_worker_init run?")
+        raise RuntimeError("CSR globals not initialized")
+
+    # Let Pylance know these are now non-optional
+    X = cast(csr_matrix, _GLOBAL_X_CSR)
+    Y = cast(np.ndarray, _GLOBAL_Y_NP)
 
     idx = np.fromiter(batch_indices, dtype=np.int64)
-    xb = torch.from_numpy(
-        _GLOBAL_X_CSR[idx].toarray().astype(np.float32, copy=False)
-    )
-    yb = torch.from_numpy(_GLOBAL_Y_NP[idx])
+
+    xb = torch.from_numpy(X[idx].toarray().astype(np.float32, copy=False))
+    yb = torch.from_numpy(Y[idx])
+
     return xb, yb
 
 
@@ -194,7 +201,7 @@ class IndexCSRDataset(Dataset):
 
 def make_loaders(
     ds_tr, ds_te, y_tr: np.ndarray, num_classes: int, args, device
-) -> tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader]:
     """High-throughput DataLoaders: more CPU workers, pinned memory, prefetch."""
     import os
 
@@ -204,47 +211,46 @@ def make_loaders(
     if num_workers <= 0:
         num_workers = cpu
 
-    common = dict(
-        num_workers=num_workers,
-        pin_memory=pin,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
-    )
+    common: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin,
+        "persistent_workers": num_workers > 0,
+        "prefetch_factor": 4 if num_workers > 0 else None,
+    }
+    common = {k: v for k, v in common.items() if v is not None}
 
     if args.weighted_sampler:
         binc = np.bincount(y_tr, minlength=num_classes)
         weights = 1.0 / np.clip(binc, 1, None)
         sample_w = weights[y_tr]
-        sampler = WeightedRandomSampler(
-            sample_w.tolist(),
-            num_samples=len(sample_w),
-            replacement=True,
-    )
-
         tr_loader = DataLoader(
             ds_tr,
             batch_size=args.batch_size,
-            sampler=sampler,
-            **{k: v for k, v in common.items() if v is not None},
+            sampler=WeightedRandomSampler(
+                sample_w.tolist(),
+                num_samples=len(sample_w),
+                replacement=True,
+            ),
+            **common,
         )
     else:
         tr_loader = DataLoader(
             ds_tr,
             batch_size=args.batch_size,
             shuffle=True,
-            **{k: v for k, v in common.items() if v is not None},
+            **common,
         )
 
     te_loader = DataLoader(
         ds_te,
         batch_size=max(256, args.batch_size),
         shuffle=False,
-        **{k: v for k, v in common.items() if v is not None},
+        **common,
     )
     return tr_loader, te_loader
 
 
-# ------------------------- training / eval -------------------------
+# ------------------------- training / eval helpers -------------------------
 def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
     """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
@@ -254,6 +260,7 @@ def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_step
 
     n_seen = 0
     t0 = time.time()
+    step = 0
     for step, (xb, yb) in enumerate(loader, 1):
         xb = xb.to(device, non_blocking=True)
         yb = torch.as_tensor(yb, device=device)
@@ -274,8 +281,8 @@ def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_step
         running_loss += loss.detach().item()
         n_seen += xb.size(0)
 
-    # flush remaining grads
-    if (step % accum_steps) != 0:
+    # flush remaining grads if there were any steps
+    if step > 0 and (step % accum_steps) != 0:
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -299,14 +306,9 @@ def predict_logits(model, loader, device) -> np.ndarray:
 @torch.no_grad()
 def evaluate(
     model, loader, device, classes: List[str]
-) -> Tuple[float, Dict, List[List[int]]]:
+) -> Tuple[float, Dict[Any, Any], List[List[int]]]:
     logits = predict_logits(model, loader, device)
     preds = logits.argmax(axis=1)
-    y_true = (
-        np.concatenate([np.asarray(y) for _, y in loader.dataset.__iter__()])
-        if False
-        else None
-    )  # Not used
 
     # Rebuild y_true from loader (safe way)
     ys = []
@@ -315,9 +317,10 @@ def evaluate(
     y_true = np.concatenate(ys)
 
     acc = (preds == y_true).mean().item()
-    report = classification_report(
+    report_raw = classification_report(
         y_true, preds, target_names=classes, output_dict=True
     )
+    report = cast(Dict[Any, Any], report_raw)
     cm = confusion_matrix(y_true, preds).tolist()
     return acc, report, cm
 
@@ -406,7 +409,15 @@ def plot_pr_roc(
     _save_plot(out_roc)
 
 
-def make_loaders_from_csr(X_tr, y_tr, X_te, y_te, num_classes: int, args, device):
+def make_loaders_from_csr(
+    X_tr,
+    y_tr: np.ndarray,
+    X_te,
+    y_te: np.ndarray,
+    num_classes: int,
+    args,
+    device,
+) -> Tuple[DataLoader, DataLoader]:
     """High-throughput DataLoaders with pinned memory and batch CSR->dense (Windows-safe)."""
     import os
 
@@ -419,43 +430,43 @@ def make_loaders_from_csr(X_tr, y_tr, X_te, y_te, num_classes: int, args, device
     ds_tr = IndexCSRDataset(X_tr, y_tr)
     ds_te = IndexCSRDataset(X_te, y_te)
 
-    common = dict(
-        num_workers=num_workers,
-        pin_memory=pin,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
-        collate_fn=collate_csr_indices,
-        worker_init_fn=csr_worker_init,
-    )
+    common: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin,
+        "persistent_workers": num_workers > 0,
+        "prefetch_factor": 4 if num_workers > 0 else None,
+        "collate_fn": collate_csr_indices,
+        "worker_init_fn": csr_worker_init,
+    }
+    common = {k: v for k, v in common.items() if v is not None}
 
     if args.weighted_sampler:
         binc = np.bincount(y_tr, minlength=num_classes)
         weights = 1.0 / np.clip(binc, 1, None)
         sample_w = weights[y_tr]
-        sampler = WeightedRandomSampler(
-            sample_w.tolist(),
-            num_samples=len(sample_w),
-            replacement=True,
-    )
-    tr_loader = DataLoader(
-        ds_tr,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        **{k: v for k, v in common.items() if v is not None},
-    )
+        tr_loader = DataLoader(
+            ds_tr,
+            batch_size=args.batch_size,
+            sampler=WeightedRandomSampler(
+                sample_w.tolist(),
+                num_samples=len(sample_w),
+                replacement=True,
+            ),
+            **common,
+        )
     else:
         tr_loader = DataLoader(
             ds_tr,
             batch_size=args.batch_size,
             shuffle=True,
-            **{k: v for k, v in common.items() if v is not None},
+            **common,
         )
 
     te_loader = DataLoader(
         ds_te,
         batch_size=max(256, args.batch_size),
         shuffle=False,
-        **{k: v for k, v in common.items() if v is not None},
+        **common,
     )
     return tr_loader, te_loader
 
@@ -522,15 +533,23 @@ def run(args: argparse.Namespace) -> int:
     Xw_te = vect_word.transform(X_te_text)
 
     vect_char = None
+    X_tr, X_te = None, None  # Ensure X_tr and X_te are always defined
     if getattr(args, "use_char", False):
         log.info(
             "[*] Building char TF-IDF (ngram=%s, max_features=%d)…",
             str(tuple(getattr(args, "char_ngram", (3, 5)))),
             getattr(args, "max_features_char", 10000),
         )
+
+        # Safely derive char_min and char_max so Pylance knows they're not None
+        char_range = getattr(args, "char_ngram", (3, 5))
+        # char_range will be a list[int] or tuple[int, int]; both are subscriptable
+        char_min = int(char_range[0])
+        char_max = int(char_range[1])
+
         vect_char = TfidfVectorizer(
             analyzer="char",
-            ngram_range=tuple(getattr(args, "char_ngram", (3, 5))),
+            ngram_range=(char_min, char_max),
             max_features=getattr(args, "max_features_char", 10000),
             sublinear_tf=True,
             dtype=np.float32,
@@ -540,12 +559,13 @@ def run(args: argparse.Namespace) -> int:
         X_tr = hstack([Xw_tr, Xc_tr], format="csr")
         X_te = hstack([Xw_te, Xc_te], format="csr")
     else:
-        X_tr, X_te = Xw_tr, Xw_te
+        X_tr = Xw_tr
+        X_te = Xw_te
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.mixed_precision and device.type == "cuda"
     log.info("Device: %s | AMP: %s", device, use_amp)
-
 
     # Datasets / Loaders (multiclass; batch CSR->dense for speed)
     tr_loader, te_loader = make_loaders_from_csr(
@@ -553,7 +573,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # Model
-    input_dim = X_tr.shape[1]
+    input_dim = X_tr.shape[1] # type: ignore
     model = TorchLogReg(input_dim, num_classes).to(device)
 
     # Loss: prioritize recall on positive class by class_weight='balanced'
@@ -582,16 +602,22 @@ def run(args: argparse.Namespace) -> int:
         if getattr(args, "binary", False):
             # Recall-heavy score: F2 at a tuned threshold
             cls = np.array(classes)
-            pos_idx = int(np.where(cls == "not_safe")[0][0])
+            pos_idx_arr = np.where(cls == "not_safe")[0]
+            if len(pos_idx_arr) == 0:
+                return 0.0
+            pos_idx = int(pos_idx_arr[0])
             prob_pos = probs[:, pos_idx]
             thr = tune_threshold(prob_pos, (y_val == pos_idx).astype(int), metric="f2")
-            y_hat = (prob_pos >= thr).astype(int)
-            # compute F2
             from sklearn.metrics import fbeta_score
 
-            return float(fbeta_score((y_val == pos_idx).astype(int), y_hat, beta=2.0))
+            return float(
+                fbeta_score(
+                    (y_val == pos_idx).astype(int),
+                    (prob_pos >= thr).astype(int),
+                    beta=2.0,
+                )
+            )
         else:
-            # multiclass macro recall
             from sklearn.metrics import recall_score
 
             y_pred = probs.argmax(axis=1)
@@ -605,15 +631,14 @@ def run(args: argparse.Namespace) -> int:
     )
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(
-        model,
-        tr_loader,
-        optimizer,
-        criterion,
-        device,
-        use_amp,
-        args.accum_steps,
-    )
-
+            model,
+            tr_loader,
+            optimizer,
+            criterion,
+            device,
+            use_amp,
+            args.accum_steps,
+        )
 
         # quick val metric focusing on recall
         score = _val_recallish_score(model)
@@ -651,48 +676,65 @@ def run(args: argparse.Namespace) -> int:
     pr_curve_png = None
     roc_curve_png = None
     if getattr(args, "binary", False):
-        pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
-        prob_pos = probs_val[:, pos_idx]
-        y_true_bin = (y_val == pos_idx).astype(int)
+        cls = np.array(classes)
+        pos_idx_arr = np.where(cls == "not_safe")[0]
+        if len(pos_idx_arr) > 0:
+            pos_idx = int(pos_idx_arr[0])
+            prob_pos = probs_val[:, pos_idx]
+            y_true_bin = (y_val == pos_idx).astype(int)
 
-        # prioritize recall subject to reasonable precision (0.90 default)
-        precision_target = 0.90
-        tuned_threshold = tune_threshold(
-            prob_pos, y_true_bin, metric="recall", prec_target=precision_target
-        )
-        log.info(
-            "Tuned threshold for recall@P>=%.2f: %.4f",
-            precision_target,
-            tuned_threshold,
-        )
+            # prioritize recall subject to reasonable precision (0.90 default or args.precision_target)
+            precision_target = (
+                args.precision_target if args.precision_target is not None else 0.90
+            )
+            tuned_threshold = tune_threshold(
+                prob_pos,
+                y_true_bin,
+                metric=args.tune_metric,
+                prec_target=precision_target,
+            )
+            log.info(
+                "Tuned threshold (%s) with P>=%.2f: %.4f",
+                args.tune_metric,
+                precision_target if precision_target is not None else -1,
+                tuned_threshold,
+            )
 
-        # plots
-        out_dir = Path(args.out).parent
-        pr_curve_png = out_dir / "pr_curve.png"
-        roc_curve_png = out_dir / "roc_curve.png"
-        plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
+            # plots
+            out_dir = Path(args.out).parent
+            pr_curve_png = out_dir / "pr_curve.png"
+            roc_curve_png = out_dir / "roc_curve.png"
+            plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
-        # ---- Compute standard metrics (post-threshold for binary if selected) ----
+    # ---- Compute standard metrics (post-threshold for binary if selected) ----
     if getattr(args, "binary", False) and tuned_threshold is not None:
-        # Binary safe vs not_safe using tuned threshold
-        pos_idx = int(np.where(np.array(classes) == "not_safe")[0][0])
-        y_true_bin = (y_val == pos_idx).astype(int)
-        y_pred_bin = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
+        cls = np.array(classes)
+        pos_idx_arr = np.where(cls == "not_safe")[0]
+        if len(pos_idx_arr) > 0:
+            pos_idx = int(pos_idx_arr[0])
+            y_true_bin = (y_val == pos_idx).astype(int)
+            y_pred_bin = (probs_val[:, pos_idx] >= tuned_threshold).astype(int)
 
-        report = classification_report(
-            y_true_bin,
-            y_pred_bin,
-            target_names=["safe", "not_safe"],
-            output_dict=True,
-        )
-        cm = confusion_matrix(y_true_bin, y_pred_bin).tolist()
-        acc = float((y_pred_bin == y_true_bin).mean())
+            report_raw = classification_report(
+                y_true_bin,
+                y_pred_bin,
+                target_names=["safe", "not_safe"],
+                output_dict=True,
+            )
+            report = cast(Dict[Any, Any], report_raw)
+            cm = confusion_matrix(y_true_bin, y_pred_bin).tolist()
+            acc = float((y_pred_bin == y_true_bin).mean())
+        else:
+            report = {}
+            cm = [[0, 0], [0, 0]]
+            acc = 0.0
     else:
         # Multiclass, or binary without a tuned threshold: use argmax
         y_pred = probs_val.argmax(axis=1)
-        report = classification_report(
+        report_raw = classification_report(
             y_val, y_pred, target_names=classes, output_dict=True
         )
+        report = cast(Dict[Any, Any], report_raw)
         cm = confusion_matrix(y_val, y_pred).tolist()
         acc = float((y_pred == y_val).mean())
     log.info("[✓] Final val_acc=%.4f", acc)

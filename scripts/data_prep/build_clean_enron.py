@@ -3,57 +3,52 @@ from __future__ import annotations
 
 import os
 import re
-import hashlib
 from pathlib import Path
+
 import pandas as pd
 
 RAW_DIR = Path("data/raw/enron")
-OUT_PATH = Path("data/processed/clean_enron.parquet")
+OUT_PATH = Path("data/processed/clean_enron.csv")
 
-HEADER_CUTOFF_RE = re.compile(r"\n\n", re.MULTILINE)  # split headers/body at first blank line
+# Split headers/body at first blank line
+HEADER_CUTOFF_RE = re.compile(r"\n\n", re.MULTILINE)
+
 
 def extract_body(text: str) -> str:
-    # crude: drop headers before first blank line
-    m = HEADER_CUTOFF_RE.split(text, maxsplit=1)
-    body = m[1] if len(m) > 1 else m[0]
+    """Drop headers before the first blank line and keep the body."""
+    parts = HEADER_CUTOFF_RE.split(text, maxsplit=1)
+    body = parts[1] if len(parts) > 1 else parts[0]
+    return body.strip()
 
-    # drop obvious legal footers / boilerplate patterns later if needed
-    body = body.strip()
-    return body
 
 def walk_enron_texts(base: Path):
+    """Yield body text for every readable file under base."""
     for root, _, files in os.walk(base):
         for fn in files:
             fpath = Path(root) / fn
             try:
                 raw = fpath.read_text(encoding="utf-8", errors="ignore")
             except Exception:
+                # unreadable file → skip
                 continue
             body = extract_body(raw)
-            if body:
-                yield body
+            # Keep everything, even if empty/short
+            yield body
+
 
 def main():
-    rows = []
-    seen = set()
+    rows: list[dict[str, str]] = []
 
     for body in walk_enron_texts(RAW_DIR):
-        # dedupe aggressively by hash
-        h = hashlib.sha256(body.encode("utf-8", errors="ignore")).hexdigest()
-        if h in seen:
-            continue
-        seen.add(h)
         rows.append({"body_text": body, "label": "safe"})
 
     df = pd.DataFrame(rows)
-    print(f"[enron] collected={len(df)} unique_safe_emails")
-
-    # drop super-short garbage
-    df = df[df["body_text"].str.len() > 40].copy()
+    print(f"[enron] collected={len(df)} emails (all labeled 'safe')")
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(OUT_PATH, index=False)
+    df.to_csv(OUT_PATH, index=False)
     print(f"[enron] wrote {OUT_PATH} rows={len(df)}")
+
 
 if __name__ == "__main__":
     main()
