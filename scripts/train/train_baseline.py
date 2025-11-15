@@ -220,19 +220,18 @@ def make_loaders(
             num_samples=len(sample_w),
             replacement=True,
     )
-
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            **{k: v for k, v in common.items() if v is not None},
-        )
+    tr_loader = DataLoader(
+        ds_tr,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        {k: v for k, v in common.items() if v is not None},
+    )
     else:
         tr_loader = DataLoader(
             ds_tr,
             batch_size=args.batch_size,
             shuffle=True,
-            **{k: v for k, v in common.items() if v is not None},
+            {k: v for k, v in common.items() if v is not None},
         )
 
     te_loader = DataLoader(
