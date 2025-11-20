@@ -9,12 +9,11 @@ import pandas as pd
 
 PROCESSED_DIR = Path("data/processed")
 
-ENRON_CSV = PROCESSED_DIR / "clean_enron.csv"
-SPAMASSASSIN_CSV = PROCESSED_DIR / "clean_spam.csv"
-NAZARIO_CSV = PROCESSED_DIR / "clean_phishing.csv"
-KAGGLE_CSV = PROCESSED_DIR / "clean_kaggle_phishing.csv"
+# Target rows per class (upper bound)
+TARGET_PER_CLASS = 30_000
 
-OUT_BALANCED = PROCESSED_DIR / "clean_all_balanced_3class.csv"
+# Name for the large balanced dataset
+OUT_BALANCED = PROCESSED_DIR / "clean_all_balanced_3class_30k.csv"
 
 
 def setup_logging() -> None:
@@ -25,27 +24,28 @@ def setup_logging() -> None:
     )
 
 
-def load_source(path: Path, source_name: str) -> pd.DataFrame:
+def load_source(path: Path) -> pd.DataFrame | None:
     logger = logging.getLogger("build_balanced")
 
-    if not path.exists():
-        logger.error("Expected processed file not found: %s", path)
-        sys.exit(1)
+    logger.info("Inspecting processed file: %s", path.name)
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        logger.warning("Failed to read %s: %s (skipping)", path, e)
+        return None
 
-    df = pd.read_csv(path)
     cols = list(df.columns)
     if "body_text" not in cols or "label" not in cols:
-        logger.error(
-            "[%s] missing required columns 'body_text'/'label' in %s. Columns: %s",
-            source_name,
-            path,
+        logger.info(
+            "Skipping %s: missing required 'body_text'/'label' columns. Columns: %s",
+            path.name,
             cols,
         )
-        sys.exit(1)
+        return None
 
     df = df[["body_text", "label"]].copy()
-    df["__source_dataset"] = source_name
-    logger.info("[%s] loaded %s rows", source_name, len(df))
+    df["__source_dataset"] = path.stem  # e.g. 'clean_enron', 'clean_kaggle_190k_spam'
+    logger.info("[%s] loaded %s rows", path.name, len(df))
     return df
 
 
@@ -55,11 +55,31 @@ def main() -> None:
 
     logger.info("Loading processed datasets from %s", PROCESSED_DIR.resolve())
 
+    if not PROCESSED_DIR.exists():
+        logger.error("Processed directory does not exist: %s", PROCESSED_DIR)
+        sys.exit(1)
+
     parts: List[pd.DataFrame] = []
-    parts.append(load_source(ENRON_CSV, "enron"))
-    parts.append(load_source(SPAMASSASSIN_CSV, "spamassassin"))
-    parts.append(load_source(NAZARIO_CSV, "nazario"))
-    parts.append(load_source(KAGGLE_CSV, "kaggle_phishing"))
+
+    # Find all CSVs in processed/, skip previous balanced outputs
+    csv_files = sorted(PROCESSED_DIR.glob("*.csv"))
+    if not csv_files:
+        logger.error("No CSV files found in %s", PROCESSED_DIR)
+        sys.exit(1)
+
+    for path in csv_files:
+        # Skip previously balanced datasets to avoid double-counting
+        if path.name.startswith("clean_all_balanced"):
+            logger.info("Skipping previously balanced file: %s", path.name)
+            continue
+
+        df = load_source(path)
+        if df is not None:
+            parts.append(df)
+
+    if not parts:
+        logger.error("No valid datasets loaded (none had body_text + label).")
+        sys.exit(1)
 
     combined = pd.concat(parts, ignore_index=True)
     logger.info("Combined rows before filtering labels: %d", len(combined))
@@ -74,16 +94,23 @@ def main() -> None:
         len(combined),
     )
 
-    logger.info("Label counts (combined):\n%s", combined["label"].value_counts())
+    label_counts = combined["label"].value_counts()
+    logger.info("Label counts (combined):\n%s", label_counts)
 
     # Determine balanced size per class
-    counts = combined["label"].value_counts().to_dict()
+    counts = label_counts.to_dict()
     if len(counts) < 3:
         logger.error("Expected 3 labels (safe/spam/phishing) but found: %s", counts)
         sys.exit(1)
 
-    n_per_class = min(counts.values())
-    logger.info("Balancing to n_per_class=%d (min over classes)", n_per_class)
+    min_available = min(counts.values())
+    n_per_class = min(TARGET_PER_CLASS, min_available)
+    logger.info(
+        "Balancing to n_per_class=%d (TARGET_PER_CLASS=%d, min_available=%d)",
+        n_per_class,
+        TARGET_PER_CLASS,
+        min_available,
+    )
 
     # Stratified sampling
     balanced_parts: List[pd.DataFrame] = []
@@ -91,10 +118,12 @@ def main() -> None:
         df_label = combined[combined["label"] == label]
         if len(df_label) < n_per_class:
             logger.error(
-                "Label %r has only %d rows (<%d). This should not happen.",
+                "Label %r has only %d rows (<%d). This should not happen "
+                "given min_available=%d.",
                 label,
                 len(df_label),
                 n_per_class,
+                min_available,
             )
             sys.exit(1)
 
