@@ -138,7 +138,7 @@ def main() -> None:
                     "body_text": body,
                     "label": "phishing",
                     "source_file": fpath.name,
-                    "source_index": idx,
+                    "source_index": idx, # type: ignore
                 }
             )
 
