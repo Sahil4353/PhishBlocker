@@ -65,14 +65,13 @@ def setup_logging(level: str = "INFO") -> None:
 def csr_worker_init(worker_id: int):
     """Runs in each worker; capture dataset's CSR pointers into globals."""
     info = torch.utils.data.get_worker_info()
-    # In the main process this can be None, but as a worker_init_fn it should be set.
     if info is None:
         return
 
     ds = info.dataset
-    # Help the type checker: we know this is always IndexCSRDataset here.
-    if not isinstance(ds, "IndexCSRDataset") and not isinstance(ds, IndexCSRDataset):
-        # isinstance with string is ignored at runtime; the second check is the real one.
+
+    # Runtime check: this must be IndexCSRDataset
+    if not isinstance(ds, IndexCSRDataset):
         raise TypeError("csr_worker_init expects an IndexCSRDataset")
 
     global _GLOBAL_X_CSR, _GLOBAL_Y_NP
@@ -254,7 +253,8 @@ def make_loaders(
 def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
     """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # Use new torch.amp.GradScaler API (device-aware), but keep enabled flag
+    scaler = torch.amp.GradScaler(device.type if use_amp else "cpu", enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
@@ -541,9 +541,8 @@ def run(args: argparse.Namespace) -> int:
             getattr(args, "max_features_char", 10000),
         )
 
-        # Safely derive char_min and char_max so Pylance knows they're not None
+        # Safely derive char_min and char_max
         char_range = getattr(args, "char_ngram", (3, 5))
-        # char_range will be a list[int] or tuple[int, int]; both are subscriptable
         char_min = int(char_range[0])
         char_max = int(char_range[1])
 
@@ -562,8 +561,13 @@ def run(args: argparse.Namespace) -> int:
         X_tr = Xw_tr
         X_te = Xw_te
 
-
+    # --- Device selection + AMP flag ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("torch.cuda.is_available() = %s", torch.cuda.is_available())
+    log.info("torch.cuda.device_count() = %s", torch.cuda.device_count())
+    if torch.cuda.is_available():
+        log.info("Selected GPU: %s", torch.cuda.get_device_name(0))
+
     use_amp = args.mixed_precision and device.type == "cuda"
     log.info("Device: %s | AMP: %s", device, use_amp)
 
@@ -573,10 +577,10 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # Model
-    input_dim = X_tr.shape[1] # type: ignore
+    input_dim = X_tr.shape[1]  # type: ignore
     model = TorchLogReg(input_dim, num_classes).to(device)
 
-    # Loss: prioritize recall on positive class by class_weight='balanced'
+    # Loss: prioritize recall by class_weight='balanced'
     weight_t = None
     if args.class_weight == "balanced":
         binc = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
@@ -671,7 +675,7 @@ def run(args: argparse.Namespace) -> int:
     probs_val = torch.softmax(torch.tensor(logits_val), dim=1).numpy()
     y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
 
-    # Threshold tuning for binary with precision floor (good recall with “good” precision)
+    # Threshold tuning for binary with precision floor
     tuned_threshold = None
     pr_curve_png = None
     roc_curve_png = None
@@ -683,7 +687,6 @@ def run(args: argparse.Namespace) -> int:
             prob_pos = probs_val[:, pos_idx]
             y_true_bin = (y_val == pos_idx).astype(int)
 
-            # prioritize recall subject to reasonable precision (0.90 default or args.precision_target)
             precision_target = (
                 args.precision_target if args.precision_target is not None else 0.90
             )
@@ -706,7 +709,7 @@ def run(args: argparse.Namespace) -> int:
             roc_curve_png = out_dir / "roc_curve.png"
             plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
-    # ---- Compute standard metrics (post-threshold for binary if selected) ----
+    # ---- Compute standard metrics ----
     if getattr(args, "binary", False) and tuned_threshold is not None:
         cls = np.array(classes)
         pos_idx_arr = np.where(cls == "not_safe")[0]
