@@ -6,7 +6,7 @@ TF-IDF + PyTorch Logistic Regression (GPU-ready)
 - Mixed precision (AMP), class weights, optional weighted sampler
 - Binary mode (safe vs not_safe) with threshold tuning
 - Temperature scaling for probability calibration
-- Saves: model state_dict, sklearn artifacts (joblib), metrics JSON, and plots (PR, ROC, CM)
+- Saves: model state_dict, sklearn artifacts (joblib), metrics JSON, and plots (PR, ROC, CM, training curves)
 """
 
 import argparse
@@ -99,7 +99,7 @@ def collate_csr_indices(batch_indices):
 
 
 # ------------------------- label normalization -------------------------
-CANON_LABELS = {
+CANON_LABELS: Dict[str, str] = {
     "ham": "safe",
     "ok": "safe",
     "legit": "safe",
@@ -109,7 +109,7 @@ CANON_LABELS = {
     "phishing": "phishing",
     "fraud": "phishing",
 }
-BIN_MAP = {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
+BIN_MAP: Dict[str, str] = {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
 
 
 def _canonicalize_label(x: str) -> Optional[str]:
@@ -166,7 +166,7 @@ class TorchLogReg(nn.Module):
         super().__init__()
         self.linear = nn.Linear(input_dim, num_classes)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
 
 
@@ -186,20 +186,20 @@ class TemperatureScaler(nn.Module):
 class IndexCSRDataset(Dataset):
     """Dataset that returns just indices; the collate_fn builds dense batches from CSR in one shot."""
 
-    def __init__(self, X_csr, y_np: np.ndarray):
+    def __init__(self, X_csr: csr_matrix, y_np: np.ndarray):
         self.X = X_csr
         self.y = y_np.astype(np.int64)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.X.shape[0]
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> int:
         # Return only the index; batching & CSR->dense happens in collate_fn
         return int(idx)
 
 
 def make_loaders(
-    ds_tr, ds_te, y_tr: np.ndarray, num_classes: int, args, device
+    ds_tr: Dataset, ds_te: Dataset, y_tr: np.ndarray, num_classes: int, args, device
 ) -> Tuple[DataLoader, DataLoader]:
     """High-throughput DataLoaders: more CPU workers, pinned memory, prefetch."""
     import os
@@ -250,11 +250,18 @@ def make_loaders(
 
 
 # ------------------------- training / eval helpers -------------------------
-def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_steps):
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    use_amp: bool,
+    accum_steps: int,
+) -> float:
     """Faster minibatch loop with AMP + gradient accumulation and simple throughput logging."""
     model.train()
-    # Use new torch.amp.GradScaler API (device-aware), but keep enabled flag
-    scaler = torch.amp.GradScaler(device.type if use_amp else "cpu", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
@@ -293,9 +300,9 @@ def train_epoch(model, loader, optimizer, criterion, device, use_amp, accum_step
 
 
 @torch.no_grad()
-def predict_logits(model, loader, device) -> np.ndarray:
+def predict_logits(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
     model.eval()
-    chunks = []
+    chunks: List[np.ndarray] = []
     for xb, _ in loader:
         xb = xb.to(device, non_blocking=True)
         logits = model(xb).detach().cpu().numpy()
@@ -305,13 +312,13 @@ def predict_logits(model, loader, device) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate(
-    model, loader, device, classes: List[str]
+    model: nn.Module, loader: DataLoader, device: torch.device, classes: List[str]
 ) -> Tuple[float, Dict[Any, Any], List[List[int]]]:
     logits = predict_logits(model, loader, device)
     preds = logits.argmax(axis=1)
 
     # Rebuild y_true from loader (safe way)
-    ys = []
+    ys: List[np.ndarray] = []
     for _, yb in loader:
         ys.append(np.asarray(yb))
     y_true = np.concatenate(ys)
@@ -326,7 +333,7 @@ def evaluate(
 
 
 def tune_temperature(
-    model, loader, device, num_classes: int, max_iter: int = 200
+    model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int, max_iter: int = 200
 ) -> float:
     """Fits temperature (NLL on val set). Returns T as float."""
     model.eval()
@@ -336,7 +343,8 @@ def tune_temperature(
     )
     nll = nn.CrossEntropyLoss()
 
-    xs, ys = [], []
+    xs: List[torch.Tensor] = []
+    ys: List[torch.Tensor] = []
     for xb, yb in loader:
         xs.append(xb.to(device, non_blocking=True))
         ys.append(torch.as_tensor(yb, device=device))
@@ -361,17 +369,17 @@ def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
 
 
 # ------------------------- plotting -------------------------
-def _save_plot(path: Path):
+def _save_plot(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(path, dpi=120)
     plt.close()
 
 
-def plot_confusion_matrix(cm: List[List[int]], classes: List[str], path: Path):
+def plot_confusion_matrix(cm: List[List[int]], classes: List[str], path: Path) -> None:
     arr = np.asarray(cm)
     fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(arr, interpolation="nearest")
+    ax.imshow(arr, interpolation="nearest")
     ax.set_title("Confusion Matrix")
     ax.set_xticks(range(len(classes)))
     ax.set_xticklabels(classes, rotation=45, ha="right")
@@ -387,9 +395,9 @@ def plot_confusion_matrix(cm: List[List[int]], classes: List[str], path: Path):
 
 def plot_pr_roc(
     y_true_bin: np.ndarray, prob_pos: np.ndarray, out_pr: Path, out_roc: Path
-):
+) -> None:
     # PR
-    prec, rec, thr = precision_recall_curve(y_true_bin, prob_pos)
+    prec, rec, _ = precision_recall_curve(y_true_bin, prob_pos)
     ap = average_precision_score(y_true_bin, prob_pos)
     plt.figure(figsize=(5, 4))
     plt.plot(rec, prec)
@@ -409,14 +417,42 @@ def plot_pr_roc(
     _save_plot(out_roc)
 
 
+def plot_multiclass_pr_roc(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    classes: List[str],
+    out_dir: Path,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    For each class k, treat it as 'positive' vs rest, and plot PR + ROC.
+    Returns two dicts: {class_name: pr_curve_path}, {class_name: roc_curve_path}.
+    """
+    pr_paths: Dict[str, str] = {}
+    roc_paths: Dict[str, str] = {}
+
+    for idx, cls in enumerate(classes):
+        y_bin = (y_true == idx).astype(int)
+        prob_pos = probs[:, idx]
+
+        pr_path = out_dir / f"pr_curve_{cls}.png"
+        roc_path = out_dir / f"roc_curve_{cls}.png"
+
+        plot_pr_roc(y_bin, prob_pos, pr_path, roc_path)
+
+        pr_paths[cls] = str(pr_path)
+        roc_paths[cls] = str(roc_path)
+
+    return pr_paths, roc_paths
+
+
 def make_loaders_from_csr(
-    X_tr,
+    X_tr: csr_matrix,
     y_tr: np.ndarray,
-    X_te,
+    X_te: csr_matrix,
     y_te: np.ndarray,
     num_classes: int,
     args,
-    device,
+    device: torch.device,
 ) -> Tuple[DataLoader, DataLoader]:
     """High-throughput DataLoaders with pinned memory and batch CSR->dense (Windows-safe)."""
     import os
@@ -507,7 +543,7 @@ def run(args: argparse.Namespace) -> int:
             "Consider using --binary or collecting more data for those classes.",
             class_counts,
         )
-        stratify_y = None
+        stratify_y: Optional[np.ndarray] = None
     else:
         stratify_y = y
 
@@ -533,7 +569,8 @@ def run(args: argparse.Namespace) -> int:
     Xw_te = vect_word.transform(X_te_text)
 
     vect_char = None
-    X_tr, X_te = None, None  # Ensure X_tr and X_te are always defined
+    X_tr_csr: csr_matrix
+    X_te_csr: csr_matrix
     if getattr(args, "use_char", False):
         log.info(
             "[*] Building char TF-IDF (ngram=%s, max_features=%d)…",
@@ -541,7 +578,6 @@ def run(args: argparse.Namespace) -> int:
             getattr(args, "max_features_char", 10000),
         )
 
-        # Safely derive char_min and char_max
         char_range = getattr(args, "char_ngram", (3, 5))
         char_min = int(char_range[0])
         char_max = int(char_range[1])
@@ -555,32 +591,26 @@ def run(args: argparse.Namespace) -> int:
         )
         Xc_tr = vect_char.fit_transform(X_tr_text)
         Xc_te = vect_char.transform(X_te_text)
-        X_tr = hstack([Xw_tr, Xc_tr], format="csr")
-        X_te = hstack([Xw_te, Xc_te], format="csr")
+        X_tr_csr = hstack([Xw_tr, Xc_tr], format="csr")
+        X_te_csr = hstack([Xw_te, Xc_te], format="csr")
     else:
-        X_tr = Xw_tr
-        X_te = Xw_te
+        X_tr_csr = Xw_tr  # type: ignore[assignment]
+        X_te_csr = Xw_te  # type: ignore[assignment]
 
-    # --- Device selection + AMP flag ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("torch.cuda.is_available() = %s", torch.cuda.is_available())
-    log.info("torch.cuda.device_count() = %s", torch.cuda.device_count())
-    if torch.cuda.is_available():
-        log.info("Selected GPU: %s", torch.cuda.get_device_name(0))
-
     use_amp = args.mixed_precision and device.type == "cuda"
     log.info("Device: %s | AMP: %s", device, use_amp)
 
     # Datasets / Loaders (multiclass; batch CSR->dense for speed)
     tr_loader, te_loader = make_loaders_from_csr(
-        X_tr, y_tr, X_te, y_te, num_classes, args, device
+        X_tr_csr, y_tr, X_te_csr, y_te, num_classes, args, device
     )
 
     # Model
-    input_dim = X_tr.shape[1]  # type: ignore
+    input_dim = X_tr_csr.shape[1]
     model = TorchLogReg(input_dim, num_classes).to(device)
 
-    # Loss: prioritize recall by class_weight='balanced'
+    # Loss: prioritize recall on positive class by class_weight='balanced'
     weight_t = None
     if args.class_weight == "balanced":
         binc = np.bincount(y_tr, minlength=num_classes).astype(np.float32)
@@ -593,20 +623,29 @@ def run(args: argparse.Namespace) -> int:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    # ---- Output dir ----
+    out_path = Path(args.out)
+    out_dir = out_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Training history ----
+    history_loss: List[float] = []
+    history_recallish: List[float] = []
+
     # ---- Train with "best-by-recallish" early model save ----
     best_metric = -1.0
-    best_state = None
+    best_state: Optional[Dict[str, torch.Tensor]] = None
 
     # In binary mode, evaluate each epoch with an F2-like score on val probs.
-    def _val_recallish_score(current_model) -> float:
+    def _val_recallish_score(current_model: nn.Module) -> float:
         logits = predict_logits(current_model, te_loader, device)
         probs = torch.softmax(torch.tensor(logits), dim=1).numpy()
         y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
 
         if getattr(args, "binary", False):
             # Recall-heavy score: F2 at a tuned threshold
-            cls = np.array(classes)
-            pos_idx_arr = np.where(cls == "not_safe")[0]
+            cls_arr = np.array(classes)
+            pos_idx_arr = np.where(cls_arr == "not_safe")[0]
             if len(pos_idx_arr) == 0:
                 return 0.0
             pos_idx = int(pos_idx_arr[0])
@@ -633,6 +672,7 @@ def run(args: argparse.Namespace) -> int:
         args.batch_size,
         args.accum_steps,
     )
+
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(
             model,
@@ -650,6 +690,10 @@ def run(args: argparse.Namespace) -> int:
             "Epoch %d/%d | loss=%.5f | recallish=%.4f", epoch, args.epochs, loss, score
         )
 
+        # record history
+        history_loss.append(loss)
+        history_recallish.append(score)
+
         if score > best_metric:
             best_metric = score
             best_state = {
@@ -662,7 +706,7 @@ def run(args: argparse.Namespace) -> int:
         model.load_state_dict(best_state)
 
     # Optional temperature scaling
-    T = None
+    T: Optional[float] = None
     if getattr(args, "calibrate", False):
         log.info("[*] Calibrating probabilities (temperature scaling)…")
         T = tune_temperature(model, te_loader, device, num_classes=num_classes)
@@ -675,13 +719,16 @@ def run(args: argparse.Namespace) -> int:
     probs_val = torch.softmax(torch.tensor(logits_val), dim=1).numpy()
     y_val = np.concatenate([np.asarray(yb) for _, yb in te_loader])
 
-    # Threshold tuning for binary with precision floor
-    tuned_threshold = None
-    pr_curve_png = None
-    roc_curve_png = None
+    # Threshold tuning for binary with precision floor (good recall with “good” precision)
+    tuned_threshold: Optional[float] = None
+    pr_curve_png: Optional[Path] = None
+    roc_curve_png: Optional[Path] = None
+    pr_curve_paths: Dict[str, str] = {}
+    roc_curve_paths: Dict[str, str] = {}
+
     if getattr(args, "binary", False):
-        cls = np.array(classes)
-        pos_idx_arr = np.where(cls == "not_safe")[0]
+        cls_arr = np.array(classes)
+        pos_idx_arr = np.where(cls_arr == "not_safe")[0]
         if len(pos_idx_arr) > 0:
             pos_idx = int(pos_idx_arr[0])
             prob_pos = probs_val[:, pos_idx]
@@ -703,16 +750,15 @@ def run(args: argparse.Namespace) -> int:
                 tuned_threshold,
             )
 
-            # plots
-            out_dir = Path(args.out).parent
+            # binary PR/ROC plots
             pr_curve_png = out_dir / "pr_curve.png"
             roc_curve_png = out_dir / "roc_curve.png"
             plot_pr_roc(y_true_bin, prob_pos, pr_curve_png, roc_curve_png)
 
-    # ---- Compute standard metrics ----
+    # ---- Compute standard metrics (post-threshold for binary if selected) ----
     if getattr(args, "binary", False) and tuned_threshold is not None:
-        cls = np.array(classes)
-        pos_idx_arr = np.where(cls == "not_safe")[0]
+        cls_arr = np.array(classes)
+        pos_idx_arr = np.where(cls_arr == "not_safe")[0]
         if len(pos_idx_arr) > 0:
             pos_idx = int(pos_idx_arr[0])
             y_true_bin = (y_val == pos_idx).astype(int)
@@ -740,20 +786,21 @@ def run(args: argparse.Namespace) -> int:
         report = cast(Dict[Any, Any], report_raw)
         cm = confusion_matrix(y_val, y_pred).tolist()
         acc = float((y_pred == y_val).mean())
+
+        # Multiclass per-class PR & ROC curves (one-vs-rest)
+        pr_curve_paths, roc_curve_paths = plot_multiclass_pr_roc(
+            y_val, probs_val, classes, out_dir
+        )
+
     log.info("[✓] Final val_acc=%.4f", acc)
 
-    # ---- Save artifacts ----
-    out_path = Path(args.out)
-    out_dir = out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # sklearn artifacts separately (for portability)
+    # ---- Save sklearn artifacts ----
     joblib.dump(vect_word, out_dir / "vectorizer_word.joblib")
     if vect_char is not None:
         joblib.dump(vect_char, out_dir / "vectorizer_char.joblib")
     joblib.dump(le, out_dir / "label_encoder.joblib")
 
-    # best model state only
+    # ---- Save best model state ----
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -763,13 +810,37 @@ def run(args: argparse.Namespace) -> int:
         out_path,
     )
 
-    # Save CM plot
+    # ---- Save confusion matrix ----
+    cm_png = out_dir / "confusion_matrix.png"
     plot_confusion_matrix(
         cm,
         classes if not getattr(args, "binary", False) else ["safe", "not_safe"],
-        out_dir / "confusion_matrix.png",
+        cm_png,
     )
 
+    # ---- Training curves ----
+    loss_curve_png = out_dir / "training_loss.png"
+    recallish_curve_png = out_dir / "training_recallish.png"
+
+    epochs_arr = np.arange(1, len(history_loss) + 1)
+
+    # Loss curve
+    plt.figure(figsize=(5, 4))
+    plt.plot(epochs_arr, history_loss, marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss vs Epoch")
+    _save_plot(loss_curve_png)
+
+    # Recallish curve
+    plt.figure(figsize=(5, 4))
+    plt.plot(epochs_arr, history_recallish, marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Recallish")
+    plt.title("Validation Recallish vs Epoch")
+    _save_plot(recallish_curve_png)
+
+    # ---- Metadata JSON ----
     metadata = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "scikit_learn_version": sklearn.__version__,
@@ -790,10 +861,15 @@ def run(args: argparse.Namespace) -> int:
         "plots": {
             "pr_curve": str(pr_curve_png) if pr_curve_png else None,
             "roc_curve": str(roc_curve_png) if roc_curve_png else None,
-            "confusion_matrix": str(out_dir / "confusion_matrix.png"),
+            "pr_curves_by_class": pr_curve_paths,
+            "roc_curves_by_class": roc_curve_paths,
+            "training_loss": str(loss_curve_png),
+            "training_recallish": str(recallish_curve_png),
+            "confusion_matrix": str(cm_png),
         },
         "early_best_metric": best_metric,
     }
+
     with open(out_path.with_suffix(".metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -930,7 +1006,7 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def main():
+def main() -> None:
     try:
         args = parse_args()
         setup_logging(args.log_level)
