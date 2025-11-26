@@ -1,86 +1,98 @@
-# PowerShell downloader for Nazario phishing corpus (one-level)
-# Usage: run in your project folder. Adjust $dst if you want another path.
+# scripts/datasets/fetch_nazario.ps1
+# Download Jose Nazario phishing corpus via explicit filename list.
+# Run from repo root:
+#   powershell -ExecutionPolicy Bypass -File .\scripts\datasets\fetch_nazario.ps1
 
-$base = "https://monkey.org/~jose/phishing/"
-$dst = "data/raw/nazario"
-New-Item -ItemType Directory -Force -Path $dst | Out-Null
+param(
+    [string]$BaseUrl = "https://monkey.org/~jose/phishing/",
+    [string]$OutDir = "data/raw/nazario"
+)
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+
+# Explicit list based on the index you pasted
+$files = @(
+    "20051114.mbox",
+    "README.txt",
+    "phishing-2015",
+    "phishing-2016",
+    "phishing-2017",
+    "phishing-2018",
+    "phishing-2019",
+    "phishing-2020",
+    "phishing-2021",
+    "phishing-2022",
+    "phishing-2023",
+    "phishing-2024",
+    "phishing0.mbox",
+    "phishing1.mbox",
+    "phishing2.mbox",
+    "phishing3.mbox",
+    "private-phishing4.mbox"
+)
+
+Write-Host "Base URL: $BaseUrl"
+Write-Host "Output dir: $OutDir"
+Write-Host "Will download $($files.Count) files:`n"
+$files | ForEach-Object { "  $_" }
 
 function Download-File {
-    param($uri, $outPath, $maxRetries = 2)
-    $temp = "$outPath.part"
+    param(
+        [string]$Uri,
+        [string]$OutPath,
+        [int]$MaxRetries = 3
+    )
+
+    $temp = "$OutPath.part"
     $attempt = 0
-    while ($attempt -le $maxRetries) {
+    while ($attempt -lt $MaxRetries) {
+        $attempt++
         try {
-            if (Test-Path $temp) { Remove-Item $temp -Force -ErrorAction SilentlyContinue }
-            Invoke-WebRequest -Uri $uri -OutFile $temp -ErrorAction Stop -UseBasicParsing
+            if (Test-Path $temp) {
+                Remove-Item $temp -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  [Attempt $attempt] $Uri"
+            Invoke-WebRequest -Uri $Uri -OutFile $temp -UseBasicParsing -ErrorAction Stop
+
             if ((Test-Path $temp) -and ((Get-Item $temp).Length -gt 0)) {
-                Move-Item -Force $temp $outPath
+                Move-Item -Force $temp $OutPath
                 return $true
             }
             else {
-                Remove-Item $temp -Force -ErrorAction SilentlyContinue
-                throw "Zero-length download"
+                Write-Warning "  Zero-length download for $Uri"
+                if (Test-Path $temp) {
+                    Remove-Item $temp -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         catch {
-            $attempt++
-            Write-Warning "Attempt $attempt failed for $uri. $($_.Exception.Message)"
-            Start-Sleep -Seconds (2 * $attempt)
-            if ($attempt -gt $maxRetries) { return $false }
+            Write-Warning "  Failed to download $Uri : $($_.Exception.Message)"
         }
+
+        Start-Sleep -Seconds (2 * $attempt)
     }
+
+    Write-Error "  Giving up on $Uri after $MaxRetries attempts."
+    return $false
 }
 
-Write-Host "Fetching directory index from $base ..."
-$response = Invoke-WebRequest -Uri $base -UseBasicParsing
+Write-Host "`nStarting downloads…`n"
 
-# collect top-level file links (.eml, .mbox, .txt)
-$topFiles = $response.Links | Where-Object { $_.href -match '\.(eml|mbox|txt)$' } | Select-Object -Unique
-if ($topFiles.Count -eq 0) { Write-Warning "No top-level files found in index. Check $base in a browser." }
+foreach ($name in $files) {
+    $uri = $BaseUrl + $name
+    $outPath = Join-Path $OutDir $name
 
-foreach ($l in $topFiles) {
-    $url = [System.Uri]::new($base, $l.href).AbsoluteUri
-    $name = Split-Path $url -Leaf
-    $out = Join-Path $dst $name
-    if (-not (Test-Path $out)) {
-        Write-Host "Downloading top-level: $name"
-        if (-not (Download-File -uri $url -outPath $out)) {
-            Write-Warning "Failed to download $url"
-        }
-    }
-    else {
+    if (Test-Path $outPath) {
         Write-Host "Skipping (exists): $name"
+        continue
+    }
+
+    Write-Host "Downloading: $name"
+    $ok = Download-File -Uri $uri -OutPath $outPath
+    if (-not $ok) {
+        Write-Warning "Failed to download: $name"
     }
 }
 
-# Find one-level subdirectories and fetch .eml/.txt from them
-$subdirs = $response.Links | Where-Object { $_.href -match '/$' -and $_.href -ne "../" } | Select-Object -Unique
-foreach ($d in $subdirs) {
-    $subUrl = [System.Uri]::new($base, $d.href).AbsoluteUri
-    Write-Host "Scanning subdir: $subUrl"
-    try {
-        $subResp = Invoke-WebRequest -Uri $subUrl -UseBasicParsing -ErrorAction Stop
-        $emls = $subResp.Links | Where-Object { $_.href -match '\.(eml|txt|mbox)$' } | Select-Object -Unique
-        foreach ($e in $emls) {
-            $eu = [System.Uri]::new($subUrl, $e.href).AbsoluteUri
-            # prefix file with subdir name to avoid collisions
-            $prefix = (Split-Path $d.href.TrimEnd('/') -Leaf)
-            $name = $prefix + "_" + (Split-Path $eu -Leaf)
-            $out = Join-Path $dst $name
-            if (-not (Test-Path $out)) {
-                Write-Host "  Downloading: $name"
-                if (-not (Download-File -uri $eu -outPath $out)) {
-                    Write-Warning "  Failed to download $eu"
-                }
-            }
-            else {
-                Write-Host "  Skipping (exists): $name"
-            }
-        }
-    }
-    catch {
-        Write-Warning "Failed to read subdir $subUrl : $($_.Exception.Message)"
-    }
-}
-
-Write-Host "Done. Files saved under: $dst"
+Write-Host "`nDone. Files saved under: $OutDir`n"
+Get-ChildItem -File $OutDir | Format-Table Name, Length
