@@ -29,12 +29,18 @@ def _unwrap_lr(est: Any) -> Any:
 
 class ModelService:
     """
-    Wraps a trained text classification pipeline (typically TF-IDF + LR).
+    Wraps a trained text classification pipeline.
+
+    Supports two backends:
+      1. Classic sklearn pipeline loaded from a .joblib file
+      2. Torch TF-IDF + Logistic Regression model loaded from a .pt file
+         via a TorchTfidfEmailModel adapter.
+
     Exposes:
       - predict_with_explanations(text, meta) -> (label, prob, reasons, decision_meta)
       - predict_proba_map(text) -> {label: prob, ...}
 
-    Now supports per-class probability thresholds loaded from metrics JSON.
+    Also supports per-class probability thresholds loaded from a metrics JSON.
     """
 
     def __init__(
@@ -44,15 +50,33 @@ class ModelService:
         metrics_path: Optional[str | Path] = None,
     ):
         self._artifact_path = str(artifact_path)
-        bundle = joblib.load(self._artifact_path)
+        path = Path(self._artifact_path)
 
-        # Accept either {"pipeline": ..., "label_encoder": ...} or a plain pipeline.
-        if isinstance(bundle, dict) and "pipeline" in bundle:
-            pipe_obj = bundle["pipeline"]
-            le_obj = bundle.get("label_encoder", None)
-        else:
+        # -----------------------------
+        # Backend selection:
+        #  - .pt  -> Torch TF-IDF adapter (TorchTfidfEmailModel)
+        #  - else -> sklearn / joblib bundle as before
+        # -----------------------------
+        if path.suffix == ".pt":
+            # Lazy import to avoid circulars / heavy deps on import time.
+            from app.services.torch_email_model import TorchTfidfEmailModel
+
+            bundle = TorchTfidfEmailModel(
+                model_path=str(path),
+                models_dir=str(path.parent),
+            )
             pipe_obj = bundle
-            le_obj = None
+            le_obj = None  # Torch adapter exposes classes_ directly
+        else:
+            bundle = joblib.load(self._artifact_path)
+
+            # Accept either {"pipeline": ..., "label_encoder": ...} or a plain pipeline.
+            if isinstance(bundle, dict) and "pipeline" in bundle:
+                pipe_obj = bundle["pipeline"]
+                le_obj = bundle.get("label_encoder", None)
+            else:
+                pipe_obj = bundle
+                le_obj = None
 
         # Explicitly annotate so static analyzers don't think these are dicts.
         self._pipe: Any = pipe_obj
@@ -62,6 +86,7 @@ class ModelService:
         if self._le is not None and hasattr(self._le, "classes_"):
             self._classes: List[str] = list(self._le.classes_)
         else:
+            # TorchTfidfEmailModel exposes classes_ too; sklearn pipelines usually do.
             self._classes = list(getattr(self._pipe, "classes_", [])) or [
                 "phishing",
                 "spam",
@@ -71,7 +96,7 @@ class ModelService:
         # Version string for audit (used in Scan.model_version)
         self.version = version or Path(self._artifact_path).stem
 
-        # Cache feature names for explanation
+        # Cache feature names for explanation (sklearn LR case only)
         self._feat_names: List[str] = self._compute_feature_names()
 
         # Thresholds (per-class min prob needed to "claim" that class)
@@ -204,13 +229,16 @@ class ModelService:
         # sourcery skip: use-contextlib-suppress
         """
         Try to recover human-readable feature names from the vectorizer(s).
-        Supports:
-        - a 'features' step that is a FeatureUnion / ColumnTransformer
-        - or a single vectorizer in the pipeline
+
+        This is best-effort and only really works for sklearn pipelines.
+        For TorchTfidfEmailModel we typically won't have LR-style coefs and
+        this will just return [] (no explanations).
         """
         names_out: List[str] = []
+
+        # Many sklearn setups have a "features" step that is a FeatureUnion / ColumnTransformer
         try:
-            fu = self._pipe.named_steps.get("features")
+            fu = getattr(self._pipe, "named_steps", {}).get("features")
         except Exception:
             fu = None
 
@@ -266,6 +294,12 @@ class ModelService:
         return None
 
     def _vectorize(self, text: str) -> csr_matrix:
+        """
+        Vectorization for LR-based sklearn pipelines.
+
+        For non-sklearn pipelines (e.g. TorchTfidfEmailModel), this may not work;
+        callers should be robust and fall back to no explanations in that case.
+        """
         feats = getattr(self._pipe, "named_steps", {}).get("features", None)
         if feats is None:
             try:
@@ -291,8 +325,20 @@ class ModelService:
         return clf, None
 
     def _top_reasons(self, text: str, class_idx: int, k: int = TOP_K) -> List[Dict]:
-        x = self._vectorize(text)  # (1, n_features) sparse
-        clf, coefs = self._get_clf_and_coefs()
+        """
+        Best-effort LR-feature explanations.
+
+        - For sklearn LR pipelines, this uses coef_ * TF-IDF feature values.
+        - For Torch or non-LR models, this will safely return [] (no explanations)
+          instead of raising.
+        """
+        try:
+            x = self._vectorize(text)  # (1, n_features) sparse
+            clf, coefs = self._get_clf_and_coefs()
+        except Exception:
+            # Non-sklearn or no vectorizer / clf → no explanations available
+            return []
+
         if coefs is None:
             return []
 
@@ -340,7 +386,8 @@ class ModelService:
 
         - final_label/final_prob are AFTER applying per-class thresholds (if any)
         - reasons[] are the top LR features supporting the *raw* predicted class
-          (we keep this behavior the same for now)
+          (we keep this behavior the same for LR models; for Torch models this
+           will usually be an empty list)
         - decision_meta is structured info about thresholding and fallback
         """
         if not hasattr(self._pipe, "predict_proba"):
