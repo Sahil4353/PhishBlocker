@@ -9,6 +9,7 @@ TF-IDF + PyTorch Logistic Regression (GPU-ready)
 - Saves: model state_dict, sklearn artifacts (joblib), metrics JSON, and plots (PR, ROC, CM, training curves)
 """
 
+import matplotlib.pyplot as plt
 import argparse
 import hashlib
 import json
@@ -28,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.sparse import csr_matrix, hstack
+from sklearn.manifold import TSNE
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import (
     average_precision_score,
@@ -42,7 +44,6 @@ from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
 
 log = logging.getLogger("train_baseline")
 
@@ -109,7 +110,8 @@ CANON_LABELS: Dict[str, str] = {
     "phishing": "phishing",
     "fraud": "phishing",
 }
-BIN_MAP: Dict[str, str] = {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
+BIN_MAP: Dict[str, str] = {"safe": "safe",
+                           "spam": "not_safe", "phishing": "not_safe"}
 
 
 def _canonicalize_label(x: str) -> Optional[str]:
@@ -149,14 +151,16 @@ def load_concat(inputs: List[str]) -> Tuple[pd.DataFrame, List[str]]:
 
     before = len(out)
     out = out[
-        (out["body_text"] != "") & (out["label"].isin({"safe", "spam", "phishing"}))
+        (out["body_text"] != "") & (
+            out["label"].isin({"safe", "spam", "phishing"}))
     ].copy()
     dropped = before - len(out)
     if dropped:
         log.info("Dropped %d rows (empty text or unknown label).", dropped)
 
     if len(out) == 0:
-        raise SystemExit("[ERR] No rows left after cleaning. Check your inputs.")
+        raise SystemExit(
+            "[ERR] No rows left after cleaning. Check your inputs.")
     return out, sha256s
 
 
@@ -372,24 +376,37 @@ def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
 def _save_plot(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(path, dpi=120)
+    plt.savefig(path, dpi=150)
     plt.close()
 
 
 def plot_confusion_matrix(cm: List[List[int]], classes: List[str], path: Path) -> None:
     arr = np.asarray(cm)
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.imshow(arr, interpolation="nearest")
-    ax.set_title("Confusion Matrix")
+
+    im = ax.imshow(arr, interpolation="nearest", cmap="Blues")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax.set_title("Confusion Matrix", fontsize=12)
     ax.set_xticks(range(len(classes)))
     ax.set_xticklabels(classes, rotation=45, ha="right")
     ax.set_yticks(range(len(classes)))
     ax.set_yticklabels(classes)
+
     for i in range(arr.shape[0]):
         for j in range(arr.shape[1]):
-            ax.text(j, i, str(arr[i, j]), ha="center", va="center")
-    ax.set_ylabel("True")
-    ax.set_xlabel("Pred")
+            ax.text(
+                j,
+                i,
+                str(arr[i, j]),
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="black",)
+
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+    ax.grid(False)
     _save_plot(path)
 
 
@@ -400,20 +417,24 @@ def plot_pr_roc(
     prec, rec, _ = precision_recall_curve(y_true_bin, prob_pos)
     ap = average_precision_score(y_true_bin, prob_pos)
     plt.figure(figsize=(5, 4))
-    plt.plot(rec, prec)
-    plt.title(f"Precision-Recall (AP={ap:.3f})")
+    plt.plot(rec, prec, linewidth=2)
+    plt.title(f"Precision–Recall (AP={ap:.3f})", fontsize=12)
     plt.xlabel("Recall")
     plt.ylabel("Precision")
+    plt.grid(True, linestyle="--", alpha=0.4)
     _save_plot(out_pr)
 
     # ROC
     fpr, tpr, _ = roc_curve(y_true_bin, prob_pos)
     auc = roc_auc_score(y_true_bin, prob_pos)
     plt.figure(figsize=(5, 4))
-    plt.plot(fpr, tpr)
-    plt.title(f"ROC (AUC={auc:.3f})")
-    plt.xlabel("FPR")
-    plt.ylabel("TPR")
+    plt.plot(fpr, tpr, linewidth=2, label=f"AUC={auc:.3f}")
+    plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    plt.title("ROC Curve", fontsize=12)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.4)
     _save_plot(out_roc)
 
 
@@ -445,66 +466,75 @@ def plot_multiclass_pr_roc(
     return pr_paths, roc_paths
 
 
-def make_loaders_from_csr(
-    X_tr: csr_matrix,
-    y_tr: np.ndarray,
-    X_te: csr_matrix,
-    y_te: np.ndarray,
-    num_classes: int,
-    args,
-    device: torch.device,
-) -> Tuple[DataLoader, DataLoader]:
-    """High-throughput DataLoaders with pinned memory and batch CSR->dense (Windows-safe)."""
-    import os
+def plot_eda_data(df: pd.DataFrame, out_dir: Path) -> None:
+    """Basic EDA: class distribution + text length histogram."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = df.copy()
+    df["text_len"] = df["body_text"].astype(str).str.len()
 
-    pin = device.type == "cuda"
-    cpu = max(1, (os.cpu_count() or 4) - 1)
-    num_workers = args.num_workers if args.num_workers is not None else cpu
-    if num_workers < 0:
-        num_workers = cpu
+    # Class distribution
+    plt.figure(figsize=(5, 4))
+    counts = df["label"].value_counts().sort_index()
+    counts.plot(kind="bar")
+    plt.title("Class Distribution")
+    plt.xlabel("Label")
+    plt.ylabel("Count")
+    plt.grid(axis="y", linestyle="--", alpha=0.4)
+    _save_plot(out_dir / "class_distribution.png")
 
-    ds_tr = IndexCSRDataset(X_tr, y_tr)
-    ds_te = IndexCSRDataset(X_te, y_te)
+    # Text length histogram (log-scale bins)
+    plt.figure(figsize=(5, 4))
+    plt.hist(df["text_len"], bins=50)
+    plt.title("Email Text Lengths")
+    plt.xlabel("Characters")
+    plt.ylabel("Frequency")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    _save_plot(out_dir / "text_length_hist.png")
 
-    common: Dict[str, Any] = {
-        "num_workers": num_workers,
-        "pin_memory": pin,
-        "persistent_workers": num_workers > 0,
-        "prefetch_factor": 4 if num_workers > 0 else None,
-        "collate_fn": collate_csr_indices,
-        "worker_init_fn": csr_worker_init,
-    }
-    common = {k: v for k, v in common.items() if v is not None}
 
-    if args.weighted_sampler:
-        binc = np.bincount(y_tr, minlength=num_classes)
-        weights = 1.0 / np.clip(binc, 1, None)
-        sample_w = weights[y_tr]
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            sampler=WeightedRandomSampler(
-                sample_w.tolist(),
-                num_samples=len(sample_w),
-                replacement=True,
-            ),
-            **common,
-        )
-    else:
-        tr_loader = DataLoader(
-            ds_tr,
-            batch_size=args.batch_size,
-            shuffle=True,
-            **common,
-        )
+def plot_tsne_clusters(
+    X_csr: csr_matrix, y: np.ndarray, classes: List[str], out_dir: Path
+) -> None:
+    """t-SNE clustering visualisation on a sample of the TF-IDF features."""
+    n_samples = min(2000, X_csr.shape[0])
+    if n_samples < 50:
+        return  # too small to be meaningful
 
-    te_loader = DataLoader(
-        ds_te,
-        batch_size=max(256, args.batch_size),
-        shuffle=False,
-        **common,
+    rng = np.random.RandomState(42)
+    idx = rng.choice(X_csr.shape[0], size=n_samples, replace=False)
+
+    X_sample = X_csr[idx].toarray()
+    y_sample = y[idx]
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=30,
+        learning_rate=200,
+        init="pca",
+        random_state=42,
+        n_iter=1000,
     )
-    return tr_loader, te_loader
+    X_emb = tsne.fit_transform(X_sample)
+
+    plt.figure(figsize=(6, 5))
+    for cls_idx, cls_name in enumerate(classes):
+        mask = y_sample == cls_idx
+        if not np.any(mask):
+            continue
+        plt.scatter(
+            X_emb[mask, 0],
+            X_emb[mask, 1],
+            s=10,
+            alpha=0.7,
+            label=cls_name,
+        )
+
+    plt.title("t-SNE Clustering of Emails (TF-IDF space)")
+    plt.xlabel("Dim 1")
+    plt.ylabel("Dim 2")
+    plt.legend(markerscale=1.5)
+    plt.grid(True, linestyle="--", alpha=0.3)
+    _save_plot(out_dir / "tsne_clusters.png")
 
 
 # ------------------------- main -------------------------
@@ -518,6 +548,12 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("[*] Loading data…")
     df, sha256s = load_concat(args.inputs)
+
+    # Basic data EDA plots (before split)
+    out_path = Path(args.out)
+    out_dir = out_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_eda_data(df, out_dir)
 
     # Optional binary collapse to emphasize recall on not_safe
     if getattr(args, "binary", False):
@@ -556,7 +592,8 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # --- TF-IDF stacks ---
-    log.info("[*] Building word TF-IDF (max_features=%d)…", args.max_features_word)
+    log.info("[*] Building word TF-IDF (max_features=%d)…",
+             args.max_features_word)
     vect_word = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
@@ -567,6 +604,9 @@ def run(args: argparse.Namespace) -> int:
     )
     Xw_tr = vect_word.fit_transform(X_tr_text)
     Xw_te = vect_word.transform(X_te_text)
+
+    # t-SNE clustering on training TF-IDF features
+    plot_tsne_clusters(X_tr_csr, y_tr, classes, out_dir)
 
     vect_char = None
     X_tr_csr: csr_matrix
@@ -650,7 +690,8 @@ def run(args: argparse.Namespace) -> int:
                 return 0.0
             pos_idx = int(pos_idx_arr[0])
             prob_pos = probs[:, pos_idx]
-            thr = tune_threshold(prob_pos, (y_val == pos_idx).astype(int), metric="f2")
+            thr = tune_threshold(
+                prob_pos, (y_val == pos_idx).astype(int), metric="f2")
             from sklearn.metrics import fbeta_score
 
             return float(
@@ -814,7 +855,8 @@ def run(args: argparse.Namespace) -> int:
     cm_png = out_dir / "confusion_matrix.png"
     plot_confusion_matrix(
         cm,
-        classes if not getattr(args, "binary", False) else ["safe", "not_safe"],
+        classes if not getattr(args, "binary", False) else [
+            "safe", "not_safe"],
         cm_png,
     )
 
@@ -826,18 +868,20 @@ def run(args: argparse.Namespace) -> int:
 
     # Loss curve
     plt.figure(figsize=(5, 4))
-    plt.plot(epochs_arr, history_loss, marker="o")
+    plt.plot(epochs_arr, history_loss, marker="o", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training Loss vs Epoch")
+    plt.grid(True, linestyle="--", alpha=0.4)
     _save_plot(loss_curve_png)
 
     # Recallish curve
     plt.figure(figsize=(5, 4))
-    plt.plot(epochs_arr, history_recallish, marker="o")
+    plt.plot(epochs_arr, history_recallish, marker="o", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Recallish")
     plt.title("Validation Recallish vs Epoch")
+    plt.grid(True, linestyle="--", alpha=0.4)
     _save_plot(recallish_curve_png)
 
     # ---- Metadata JSON ----
@@ -848,7 +892,8 @@ def run(args: argparse.Namespace) -> int:
         "cuda": getattr(torch.version, "cuda", None),
         "device": str(device),
         "classes": (
-            classes if not getattr(args, "binary", False) else ["safe", "not_safe"]
+            classes if not getattr(args, "binary", False) else [
+                "safe", "not_safe"]
         ),
         "class_distribution": class_counts,
         "accuracy": acc,
@@ -903,7 +948,8 @@ def tune_threshold(
     prec_target: Optional[float] = None,
 ) -> float:
     # Evaluate on all unique thresholds from PR curve
-    precisions, recalls, thresholds = precision_recall_curve(y_true_bin, prob_pos)
+    precisions, recalls, thresholds = precision_recall_curve(
+        y_true_bin, prob_pos)
     thresholds = np.concatenate([thresholds, [1.0]])  # align lengths
     best_thr, best_score = 0.5, -1.0
 
@@ -958,13 +1004,15 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--class-weight", choices=["none", "balanced"], default="balanced")
+    ap.add_argument("--class-weight",
+                    choices=["none", "balanced"], default="balanced")
     ap.add_argument(
         "--weighted-sampler",
         action="store_true",
         help="Enable WeightedRandomSampler on train loader",
     )
-    ap.add_argument("--mixed-precision", dest="mixed_precision", action="store_true")
+    ap.add_argument("--mixed-precision",
+                    dest="mixed_precision", action="store_true")
     ap.add_argument(
         "--no-mixed-precision", dest="mixed_precision", action="store_false"
     )
