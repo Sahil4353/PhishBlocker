@@ -2,24 +2,26 @@
 profiling_gpu.py
 Full inference benchmarking with GPU/CPU utilization tracking.
 
-Outputs:
+Outputs (inside <out_dir>/benchmark):
 - inference_latency_hist.png
 - gpu_usage.png
+- gpu_vram.png
 - cpu_usage.png
 - memory_timeline.png
 - profiling.csv
 
-Benchmark mode B = full validation.
+Intended to be used for "full inference benchmark" on the validation loader.
 """
 
 import time
+from pathlib import Path
+from typing import Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
 import psutil
 import GPUtil
-import numpy as np
-import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
-from typing import List, Tuple
 import torch
 
 sns.set_theme(style="whitegrid")
@@ -28,7 +30,7 @@ sns.set_theme(style="whitegrid")
 # =============================================================
 # Utility: Safe plotting
 # =============================================================
-def _save(path: Path):
+def _save(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(path, dpi=170)
@@ -39,15 +41,22 @@ def _save(path: Path):
 # BENCHMARK CORE
 # =============================================================
 @torch.no_grad()
-def benchmark_inference(model, loader, device, out_dir: Path):
+def benchmark_inference(model, loader, device, out_dir: Path) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Measures:
-        - batch latency
-        - GPU load
-        - GPU mem (VRAM)
-        - CPU load
-        - System RAM
-    Logs per batch to profiling.csv
+    Measures, per batch:
+        - latency
+        - GPU utilization (%)
+        - GPU memory (VRAM %) – first GPU only
+        - CPU utilization (%)
+        - System RAM (%)
+
+    Logs per batch to profiling.csv in out_dir.
     """
     latencies = []
     gpu_util = []
@@ -64,12 +73,13 @@ def benchmark_inference(model, loader, device, out_dir: Path):
         start = time.time()
 
         xb = xb.to(device, non_blocking=True)
-        _ = model(xb)  # forward only
+        _ = model(xb)  # forward pass only
 
         end = time.time()
 
         # record latency
-        latencies.append(end - start)
+        latency = end - start
+        latencies.append(latency)
 
         # sample system stats
         cpu = psutil.cpu_percent(interval=None)
@@ -77,45 +87,53 @@ def benchmark_inference(model, loader, device, out_dir: Path):
         cpu_util.append(cpu)
         sys_mem.append(mem)
 
-        # sample GPU stats
+        # sample GPU stats (first GPU if present)
         gpus = GPUtil.getGPUs()
         if gpus:
             cuda = gpus[0]
-            gpu_util.append(cuda.load * 100)
-            gpu_mem.append(cuda.memoryUtil * 100)
+            gpu_util.append(cuda.load * 100.0)
+            gpu_mem.append(cuda.memoryUtil * 100.0)
         else:
-            gpu_util.append(0)
-            gpu_mem.append(0)
+            gpu_util.append(0.0)
+            gpu_mem.append(0.0)
 
-        csv_rows.append([
-            i,
-            latencies[-1],
-            cpu_util[-1],
-            sys_mem[-1],
-            gpu_util[-1],
-            gpu_mem[-1],
-        ])
+        csv_rows.append(
+            [
+                i,
+                latency,
+                cpu_util[-1],
+                sys_mem[-1],
+                gpu_util[-1],
+                gpu_mem[-1],
+            ]
+        )
 
     total_time = time.time() - t0
 
-    # =============================================================
+    # ---------------------------------------------------------
     # Write profiling CSV
-    # =============================================================
+    # ---------------------------------------------------------
     out_csv = out_dir / "profiling.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_csv, "w") as f:
+    with open(out_csv, "w", encoding="utf-8") as f:
         f.write("batch,latency,cpu,sys_ram,gpu,gpu_vram\n")
         for row in csv_rows:
             f.write(",".join(str(x) for x in row) + "\n")
 
     print(f"[Profiler] batches={len(latencies)} | time={total_time:.2f}s")
-    return np.array(latencies), np.array(cpu_util), np.array(sys_mem), np.array(gpu_util), np.array(gpu_mem)
+    return (
+        np.array(latencies, dtype=float),
+        np.array(cpu_util, dtype=float),
+        np.array(sys_mem, dtype=float),
+        np.array(gpu_util, dtype=float),
+        np.array(gpu_mem, dtype=float),
+    )
 
 
 # =============================================================
 # VISUALIZATION
 # =============================================================
-def plot_latency_hist(latencies: np.ndarray, out_dir: Path):
+def plot_latency_hist(latencies: np.ndarray, out_dir: Path) -> None:
     plt.figure(figsize=(6, 4))
     sns.histplot(latencies, bins=40, color="#4e79a7")
     plt.xlabel("Latency per batch (seconds)")
@@ -124,7 +142,13 @@ def plot_latency_hist(latencies: np.ndarray, out_dir: Path):
     _save(out_dir / "inference_latency_hist.png")
 
 
-def plot_timelines(cpu, sys_ram, gpu, gpu_mem, out_dir: Path):
+def plot_timelines(
+    cpu: np.ndarray,
+    sys_ram: np.ndarray,
+    gpu: np.ndarray,
+    gpu_mem: np.ndarray,
+    out_dir: Path,
+) -> None:
     steps = np.arange(len(cpu))
 
     # CPU
@@ -151,7 +175,7 @@ def plot_timelines(cpu, sys_ram, gpu, gpu_mem, out_dir: Path):
     plt.ylabel("VRAM %")
     _save(out_dir / "gpu_vram.png")
 
-    # RAM
+    # System RAM
     plt.figure(figsize=(6, 4))
     plt.plot(steps, sys_ram, color="#d62728")
     plt.title("System RAM Usage (%)")
@@ -163,8 +187,37 @@ def plot_timelines(cpu, sys_ram, gpu, gpu_mem, out_dir: Path):
 # =============================================================
 # PUBLIC ENTRY
 # =============================================================
-def run_gpu_benchmark(model, loader, device, out_dir: Path):
-    out = out_dir / "benchmark"
-    out.mkdir(parents=True, exist_ok=True)
+def run_gpu_benchmark(model, loader, device, out_dir: Path) -> dict:
+    """
+    Convenience entry:
+      - runs full benchmark over `loader`
+      - writes CSV + plots to <out_dir>/benchmark
+      - returns a small summary dict (batches, mean latency, p95)
+    """
+    bench_dir = out_dir / "benchmark"
+    bench_dir.mkdir(parents=True, exist_ok=True)
 
-    latencies, cpu, sysram, gpu
+    latencies, cpu, sys_ram, gpu, gpu_mem = benchmark_inference(
+        model, loader, device, bench_dir
+    )
+
+    if len(latencies) == 0:
+        return {
+            "batches": 0,
+            "mean_latency": 0.0,
+            "p95_latency": 0.0,
+        }
+
+    plot_latency_hist(latencies, bench_dir)
+    plot_timelines(cpu, sys_ram, gpu, gpu_mem, bench_dir)
+
+    summary = {
+        "batches": int(len(latencies)),
+        "mean_latency": float(latencies.mean()),
+        "p95_latency": float(np.percentile(latencies, 95)),
+    }
+    print(
+        f"[Profiler] mean={summary['mean_latency']:.4f}s | "
+        f"p95={summary['p95_latency']:.4f}s"
+    )
+    return summary
