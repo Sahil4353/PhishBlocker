@@ -1,35 +1,58 @@
 #!/usr/bin/env python
 """
 train_baseline.py
-Orchestrator entrypoint for PhishBlocker 3-class / binary TF-IDF models.
+Clean OOP orchestrator for PhishBlocker TF-IDF baseline model.
 
-Responsibilities:
-- CLI parsing
-- loading CSV
-- building TF-IDF features
-- calling EDA module
-- constructing loaders
-- model + training
-- calibration and evaluation
-- saving artifacts
+Features:
+- CSV ingestion + hashing
+- Label canonicalization
+- TF-IDF (word + optional char) feature stack
+- EDA plots
+- DataLoaders (CSR -> dense)
+- Model training with AMP + accumulation
+- Early checkpointing
+- Temperature scaling (post-hoc calibration)
+- Full evaluation (PR/ROC, confusion, curves)
+- Optional GPU profiling
+- Strong metadata export
+
+Author: You + ChatGPT refactor
 """
 
+from __future__ import annotations
+
+# =========================================================
+# STD LIB
+# =========================================================
 import argparse
 import logging
-import sys
+import json
+import joblib
 from pathlib import Path
 from datetime import datetime, timezone
 
-# =============== PROJECT MODULES ===================
+# =========================================================
+# ML / PY LIBS
+# =========================================================
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# =========================================================
+# PROJECT MODULES
+# =========================================================
 from scripts.train.data_loader import make_loaders
 from scripts.train.model import TorchLogReg, TemperatureScaler
 from scripts.train.trainer import train_epoch, evaluate, predict_logits
-from scripts.train.profiling_gpu import run_gpu_benchmark
 from scripts.train.plotting_eda import run_eda
 from scripts.train.plotting_ml import (
-    plot_multiclass_pr_roc,
     plot_confusion_matrix,
-    plot_training_curves
+    plot_multiclass_pr_roc,
+    plot_training_curves,
 )
 from scripts.train.utils_common import (
     seed_everything,
@@ -38,276 +61,325 @@ from scripts.train.utils_common import (
     tune_threshold,
     apply_temperature,
 )
-
-# Builtin libs
-import json
-import joblib
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
-log = logging.getLogger("train")
+from scripts.train.profiling_gpu import run_gpu_benchmark
 
 
-# ============================================================
-# =========== MAIN HIGH-LEVEL ORCHESTRATION ==================
-# ============================================================
-def run(args: argparse.Namespace):
+log = logging.getLogger("pipeline")
 
-    # Setup
-    seed_everything(args.seed)
-    out_path = Path(args.out)
-    out_dir = out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("[*] Loading datasets …")
-    df, sha256 = load_concat_df(args.inputs)
-    df = canonicalize_labels(df)
+# =========================================================
+# PIPELINE CLASS
+# =========================================================
+class TrainerPipeline:
+    """
+    Encapsulates entire ML lifecycle:
+    - load → prepare → train → eval → export
+    """
 
-    # Optional binary collapse
-    if args.binary:
-        df["label"] = df["label"].map({
-            "safe": "safe",
-            "spam": "not_safe",
-            "phishing": "not_safe"
-        })
+    def __init__(self, args):
+        self.args = args
+        seed_everything(args.seed)
+        self.out_path = Path(args.out)
+        self.out_dir = self.out_path.parent
+        self.out_dir.mkdir(parents=True, exist_ok=True)
 
-    X_text = df["body_text"].astype(str).values
-    y_text = df["label"].values
+        # device
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        log.info(f"[Device] {self.device}")
 
-    # Encode
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder().fit(y_text)
-    y = le.transform(y_text)
-    classes = list(le.classes_)
-    num_classes = len(classes)
+    # -----------------------------------------------------
+    # DATA
+    # -----------------------------------------------------
+    def load_data(self):
+        df, sha = load_concat_df(self.args.inputs)
+        df = canonicalize_labels(df)
 
-    log.info(f"Classes: {classes}")
+        # binary collapse
+        if self.args.binary:
+            df["label"] = df["label"].map({
+                "safe": "safe",
+                "spam": "not_safe",
+                "phishing": "not_safe",
+            })
 
-    # --------- Train / Test Split ------------
-    from sklearn.model_selection import train_test_split
-    Xtr_txt, Xte_txt, ytr, yte = train_test_split(
-        X_text,
-        y,
-        test_size=args.val_size,
-        random_state=args.seed,
-        stratify=y,
-    )
+        self.df = df
+        self.sha = sha
+        log.info(f"[Data] Loaded {len(df)} rows")
 
-    # -------- Vectorization ------------
-    log.info("[*] Building TF-IDF features …")
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    vect_word = TfidfVectorizer(
-        analyzer="word",
-        ngram_range=(1, 2),
-        max_features=args.max_features_word,
-        sublinear_tf=True,
-        stop_words="english",
-        dtype=np.float32,
-    )
-    Xw_tr = vect_word.fit_transform(Xtr_txt)
-    Xw_te = vect_word.transform(Xte_txt)
+    def encode_labels(self):
+        y_raw = self.df["label"].astype(str).values
+        self.le = LabelEncoder().fit(y_raw)
+        self.y_all = self.le.transform(y_raw)
+        self.classes = list(self.le.classes_)
+        self.num_classes = len(self.classes)
+        log.info(f"[Classes] {self.classes}")
 
-    # Char model?
-    if args.use_char:
-        vect_char = TfidfVectorizer(
-            analyzer="char",
-            ngram_range=tuple(args.char_ngram),
-            max_features=args.max_features_char,
+    def split_data(self):
+        Xtxt = self.df["body_text"].astype(str).values
+        self.tr_text, self.te_text, self.tr_y, self.te_y = train_test_split(
+            Xtxt,
+            self.y_all,
+            test_size=self.args.val_size,
+            random_state=self.args.seed,
+            stratify=self.y_all,
+        )
+        log.info("[Split] train=%d  test=%d", len(
+            self.tr_text), len(self.te_text))
+
+    # -----------------------------------------------------
+    # FEATURES
+    # -----------------------------------------------------
+    def vectorize(self):
+        log.info("[TF-IDF] Building word model…")
+        self.vect_word = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            max_features=self.args.max_features_word,
             sublinear_tf=True,
+            stop_words="english",
             dtype=np.float32,
         )
-        Xc_tr = vect_char.fit_transform(Xtr_txt)
-        Xc_te = vect_char.transform(Xte_txt)
+        Xw_tr = self.vect_word.fit_transform(self.tr_text)
+        Xw_te = self.vect_word.transform(self.te_text)
 
-        from scipy.sparse import hstack
-        X_tr_csr = hstack([Xw_tr, Xc_tr], format="csr")
-        X_te_csr = hstack([Xw_te, Xc_te], format="csr")
-    else:
-        vect_char = None
-        X_tr_csr, X_te_csr = Xw_tr, Xw_te
+        if self.args.use_char:
+            log.info("[TF-IDF] Adding character model…")
+            self.vect_char = TfidfVectorizer(
+                analyzer="char",
+                ngram_range=tuple(self.args.char_ngram),
+                max_features=self.args.max_features_char,
+                sublinear_tf=True,
+                dtype=np.float32,
+            )
+            Xc_tr = self.vect_char.fit_transform(self.tr_text)
+            Xc_te = self.vect_char.transform(self.te_text)
 
-    # ---------------------------------------------------------
-    # -------- EDA VISUALS (skip on very large) ---------------
-    # ---------------------------------------------------------
-    if not args.no_eda:
-        run_eda(df, X_tr_csr, ytr, classes, out_dir)
+            from scipy.sparse import hstack
+            self.X_tr = hstack([Xw_tr, Xc_tr], format="csr")
+            self.X_te = hstack([Xw_te, Xc_te], format="csr")
+        else:
+            self.vect_char = None
+            self.X_tr, self.X_te = Xw_tr, Xw_te
 
-    # ---------------------------------------------------------
-    # -------- DATA LOADERS -----------------------------------
-    # ---------------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tr_loader, te_loader = make_loaders(
-        X_tr_csr, ytr,
-        X_te_csr, yte,
-        num_classes,
-        args,
-        device,
-    )
-    log.info(f"Device: {device} | Mixed Precision: {args.mixed_precision}")
+        log.info("[Features] train=%s test=%s",
+                 self.X_tr.shape, self.X_te.shape)
 
-    # ---------------------------------------------------------
-    # -------- MODEL ------------------------------------------
-    # ---------------------------------------------------------
-    model = TorchLogReg(X_tr_csr.shape[1], num_classes).to(device)
+    # -----------------------------------------------------
+    # EDA
+    # -----------------------------------------------------
+    def run_eda(self):
+        if self.args.no_eda:
+            return
 
-    # Loss weights (class imbalance)
-    if args.class_weight == "balanced":
-        binc = np.bincount(ytr, minlength=num_classes)
-        w = (len(ytr) / np.clip(binc, 1, None)) / num_classes
-        weight = torch.tensor(w, dtype=torch.float32, device=device)
-        criterion = nn.CrossEntropyLoss(weight=weight)
-        log.info(f"Class weights: {w.tolist()}")
-    else:
-        criterion = nn.CrossEntropyLoss()
+        log.info("[EDA] generating plots…")
 
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+        # Use full dataset embeddings
+        X_all = self.vect_word.transform(self.df["body_text"])
+        if self.vect_char:
+            from scipy.sparse import hstack
+            X_all = hstack(
+                [X_all, self.vect_char.transform(self.df["body_text"])],
+                format="csr",
+            )
+        y_all = self.le.transform(self.df["label"])
 
-    # ---------------------------------------------------------
-    # -------- TRAIN LOOP -------------------------------------
-    # ---------------------------------------------------------
-    history_loss = []
-    history_metric = []
-    best_metric = -1
-    best_state = None
+        run_eda(self.df, X_all, y_all, self.classes, self.out_dir)
 
-    for epoch in range(1, args.epochs + 1):
-        ep_loss = train_epoch(
-            model,
-            tr_loader,
-            optimizer,
-            criterion,
-            device,
-            args.mixed_precision,
-            args.accum_steps,
+    # -----------------------------------------------------
+    # MODEL + TRAIN
+    # -----------------------------------------------------
+    def build_model(self):
+        dim = self.X_tr.shape[1]
+        self.model = TorchLogReg(dim, self.num_classes).to(self.device)
+
+        if self.args.class_weight == "balanced":
+            binc = np.bincount(self.tr_y, minlength=self.num_classes)
+            w = (len(self.tr_y) / np.clip(binc, 1, None)) / self.num_classes
+            weight = torch.tensor(w, dtype=torch.float32, device=self.device)
+            self.criterion = nn.CrossEntropyLoss(weight=weight)
+            log.info(f"[ClassWeights] {w.tolist()}")
+        else:
+            self.criterion = nn.CrossEntropyLoss()
+
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.args.lr,
+            weight_decay=self.args.weight_decay,
         )
-        history_loss.append(ep_loss)
 
-        # macro recall
+    def build_loaders(self):
+        self.tr_loader, self.te_loader = make_loaders(
+            self.X_tr, self.tr_y,
+            self.X_te, self.te_y,
+            self.num_classes,
+            self.args,
+            self.device,
+        )
+        log.info("[Loader] workers=%d AMP=%s",
+                 self.args.num_workers, self.args.mixed_precision)
+
+    def train(self):
+        history_loss = []
+        history_metric = []
+        best_metric = -1
+        best_state = None
+
         from sklearn.metrics import recall_score
-        logits_val = predict_logits(model, te_loader, device)
-        preds = logits_val.argmax(1)
-        m = recall_score(yte, preds, average="macro")
-        history_metric.append(m)
 
-        log.info(
-            f"Epoch {epoch}/{args.epochs} | loss={ep_loss:.4f} | recall={m:.4f}")
+        for epoch in range(1, self.args.epochs + 1):
+            ep_loss = train_epoch(
+                self.model,
+                self.tr_loader,
+                self.optimizer,
+                self.criterion,
+                self.device,
+                self.args.mixed_precision,
+                self.args.accum_steps,
+            )
+            history_loss.append(ep_loss)
 
-        if m > best_metric:
-            best_metric = m
-            best_state = {k: v.cpu().clone()
-                          for k, v in model.state_dict().items()}
+            logits_val = predict_logits(
+                self.model, self.te_loader, self.device)
+            preds = logits_val.argmax(1)
+            m = recall_score(self.te_y, preds, average="macro")
+            history_metric.append(m)
 
-    if best_state:
-        model.load_state_dict(best_state)
+            log.info(
+                f"[Epoch {epoch}/{self.args.epochs}] loss={ep_loss:.4f} recall={m:.4f}"
+            )
 
-    # ---------------------------------------------------------
-    # -------- TEMPERATURE SCALING ----------------------------
-    # ---------------------------------------------------------
-    T = None
-    if args.calibrate:
-        scaler = TemperatureScaler().to(device)
+            if m > best_metric:
+                best_metric = m
+                best_state = {
+                    k: v.cpu().clone() for k, v in self.model.state_dict().items()
+                }
+
+        # restore best
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        self.history_loss = history_loss
+        self.history_metric = history_metric
+
+    # -----------------------------------------------------
+    # CALIBRATION
+    # -----------------------------------------------------
+    def calibrate(self):
+        if not self.args.calibrate:
+            self.T = None
+            return
+
+        log.info("[Calibration] Temperature scaling…")
+        scaler = TemperatureScaler().to(self.device)
         optT = optim.LBFGS(scaler.parameters(), lr=0.5)
 
-        # gather val
-        Xs = []
-        Ys = []
-        for xb, yb in te_loader:
-            Xs.append(xb.to(device))
-            Ys.append(yb.to(device))
-        Xv = torch.cat(Xs, 0)
-        Yv = torch.cat(Ys, 0)
+        Xs, Ys = [], []
+        for xb, yb in self.te_loader:
+            Xs.append(xb.to(self.device))
+            Ys.append(yb.to(self.device))
+        Xval = torch.cat(Xs, 0)
+        Yval = torch.cat(Ys, 0)
 
         ce = nn.CrossEntropyLoss()
 
         def closure():
             optT.zero_grad()
-            logits = model(Xv)
-            logits_T = scaler(logits)
-            loss = ce(logits_T, Yv)
+            logits = self.model(Xval)
+            loss = ce(scaler(logits), Yval)
             loss.backward()
             return loss
 
         optT.step(closure)
-        T = float(torch.exp(scaler.logT).cpu().item())
-        log.info(f"[Calibration] Temperature: {T:.4f}")
+        self.T = float(torch.exp(scaler.logT).cpu().item())
+        log.info(f"[Calibration] T={self.T:.4f}")
 
-    # ---------------------------------------------------------
-    # -------- FINAL EVAL -------------------------------------
-    # ---------------------------------------------------------
-    logits_final = predict_logits(model, te_loader, device)
-    if T:
-        logits_final = apply_temperature(logits_final, T)
+    # -----------------------------------------------------
+    # EVALUATION
+    # -----------------------------------------------------
+    def evaluate(self):
+        logits = predict_logits(self.model, self.te_loader, self.device)
+        if self.T:
+            logits = apply_temperature(logits, self.T)
 
-    probs = torch.softmax(torch.tensor(logits_final), 1).numpy()
-    pred = probs.argmax(1)
+        self.probs = torch.softmax(torch.tensor(logits), 1).numpy()
+        self.pred = self.probs.argmax(1)
 
-    # metrics
-    from sklearn.metrics import classification_report, confusion_matrix
-    rep = classification_report(
-        yte, pred, target_names=classes, output_dict=True)
-    cm = confusion_matrix(yte, pred).tolist()
+        from sklearn.metrics import classification_report, confusion_matrix
+        self.report = classification_report(
+            self.te_y, self.pred, target_names=self.classes, output_dict=True
+        )
+        self.cm = confusion_matrix(self.te_y, self.pred).tolist()
 
-    # ---------------------------------------------------------
-    # ---------- PLOTS ----------------------------------------
-    # ---------------------------------------------------------
-    plot_confusion_matrix(cm, classes, out_dir / "confusion_matrix.png")
-    plot_training_curves(history_loss, history_metric, out_dir)
-    pr_paths, roc_paths = plot_multiclass_pr_roc(yte, probs, classes, out_dir)
+    # -----------------------------------------------------
+    # PLOTS
+    # -----------------------------------------------------
+    def plots(self):
+        plot_confusion_matrix(self.te_y, self.pred, self.classes, self.out_dir)
+        plot_training_curves(
+            self.history_loss, self.history_metric, self.out_dir)
+        self.pr_paths, self.roc_paths = plot_multiclass_pr_roc(
+            self.te_y, self.probs, self.classes, self.out_dir
+        )
 
-    # ---------------------------------------------------------
-    # -------- SAVE ARTIFACTS ---------------------------------
-    # ---------------------------------------------------------
-    joblib.dump(vect_word, out_dir / "vectorizer_word.joblib")
-    if vect_char:
-        joblib.dump(vect_char, out_dir / "vectorizer_char.joblib")
-    joblib.dump(le, out_dir / "label_encoder.joblib")
+    # -----------------------------------------------------
+    # GPU PROFILING
+    # -----------------------------------------------------
+    def profile(self):
+        if self.args.profile:
+            run_gpu_benchmark(self.model, self.te_loader,
+                              self.device, self.out_dir)
 
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "input_dim": X_tr_csr.shape[1],
-            "classes": classes,
-        },
-        out_path,
-    )
+    # -----------------------------------------------------
+    # SAVE ARTIFACTS
+    # -----------------------------------------------------
+    def save(self):
+        log.info("[Save] Artifacts…")
+        joblib.dump(self.vect_word, self.out_dir / "vectorizer_word.joblib")
+        if self.vect_char:
+            joblib.dump(self.vect_char, self.out_dir /
+                        "vectorizer_char.joblib")
+        joblib.dump(self.le, self.out_dir / "label_encoder.joblib")
 
-    metadata = {
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "device": str(device),
-        "classes": classes,
-        "class_distribution": df["label"].value_counts().to_dict(),
-        "metrics": rep,
-        "cm": cm,
-        "temperature": T,
-        "plots": {
-            "confusion_matrix": str(out_dir / "confusion_matrix.png"),
-            "pr_curves": pr_paths,
-            "roc_curves": roc_paths,
-        },
-        "sha256": sha256,
-    }
+        torch.save(
+            {
+                "model_state": self.model.state_dict(),
+                "input_dim": self.X_tr.shape[1],
+                "classes": self.classes,
+            },
+            self.out_path,
+        )
 
-    with open(out_path.with_suffix(".metrics.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+        metadata = {
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "device": str(self.device),
+            "classes": self.classes,
+            "class_distribution": self.df["label"].value_counts().to_dict(),
+            "metrics": self.report,
+            "cm": self.cm,
+            "temperature": self.T,
+            "sha256": self.sha,
+            "plots": {
+                "confusion_matrix": str(self.out_dir / "confusion_matrix.png"),
+                "pr": self.pr_paths,
+                "roc": self.roc_paths,
+            },
+        }
 
-    log.info("[✓] Done.")
-    return 0
+        with open(self.out_path.with_suffix(".metrics.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
 
 
-# ============================================================
+# =========================================================
 # CLI
-# ============================================================
+# =========================================================
 def parse_args():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--inputs", nargs="+", required=True)
+    ap.add_argument("--out", required=True)
+
     ap.add_argument("--val-size", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
 
@@ -328,12 +400,14 @@ def parse_args():
     ap.add_argument("--binary", action="store_true")
 
     ap.add_argument("--calibrate", action="store_true")
-
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--profile", action="store_true")
     ap.add_argument("--no-eda", action="store_true")
 
-    ap.add_argument("--log-level", default="INFO")
+    ap.add_argument("--lr", type=float, default=0.001)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--weighted-sampler", action="store_true", default=False)
 
+    ap.add_argument("--log-level", default="INFO")
     return ap.parse_args()
 
 
@@ -344,10 +418,23 @@ def main():
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     try:
-        sys.exit(run(args))
+        pipeline = TrainerPipeline(args)
+        pipeline.load_data()
+        pipeline.encode_labels()
+        pipeline.split_data()
+        pipeline.vectorize()
+        pipeline.run_eda()
+        pipeline.build_model()
+        pipeline.build_loaders()
+        pipeline.train()
+        pipeline.calibrate()
+        pipeline.evaluate()
+        pipeline.plots()
+        pipeline.profile()
+        pipeline.save()
     except Exception as e:
         log.exception("Fatal error: %s", e)
-        sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

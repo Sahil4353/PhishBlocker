@@ -31,15 +31,31 @@ def _save(path: Path):
 def plot_class_distribution(df: pd.DataFrame, out: Path, title_suffix=""):
     counts = df["label"].value_counts().sort_index()
 
+    # Create properly named dataframe
+    counts_df = pd.DataFrame({
+        "label": counts.index,
+        "count": counts.values
+    })
+
     plt.figure(figsize=(6, 4))
-    ax = sns.barplot(
-        x=counts.index,
-        y=counts.values,
+    sns.barplot(
+        data=counts_df,
+        x="label",
+        y="count",
+        hue="label",
+        legend=False,
         palette=["#4caf50", "#ff9800", "#e53935"],  # safe / spam / phishing
     )
 
-    for i, v in enumerate(counts.values):
-        ax.text(i, v + 0.01 * v, str(v), ha="center", fontsize=10)
+    # display numbers over bars
+    for i, row in counts_df.iterrows():
+        plt.text(
+            i,
+            row["count"] + row["count"] * 0.01,
+            str(row["count"]),
+            ha="center",
+            fontsize=10,
+        )
 
     plt.xlabel("Class")
     plt.ylabel("Email Count")
@@ -93,11 +109,11 @@ def plot_tsne_clusters(X_csr, y, classes, out: Path):
 
     emb = TSNE(
         n_components=2,
-        learning_rate=200,
+        learning_rate="auto",
         perplexity=35,
         init="pca",
         random_state=42,
-        n_iter=1000,
+        max_iter=1000,
     ).fit_transform(X_sample)
 
     plt.figure(figsize=(7, 6))
