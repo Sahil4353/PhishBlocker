@@ -62,6 +62,10 @@ def plot_multiclass_pr_roc(y_true, probs, classes, out: Path):
         y_bin = (y_true == i).astype(int)
         prob_pos = probs[:, i]
 
+        if y_bin.sum() == 0:
+            # no positives for this class; skip to avoid roc_auc_score error
+            continue
+
         # ---- PR curve ----
         prec, rec, _ = precision_recall_curve(y_bin, prob_pos)
         ap = average_precision_score(y_bin, prob_pos)
