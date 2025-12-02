@@ -198,3 +198,10 @@ def tune_threshold(
             best_thr = float(t)
 
     return float(best_thr)
+
+def collapse_binary(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["label"] = df["label"].map(
+        {"safe": "safe", "spam": "not_safe", "phishing": "not_safe"}
+    )
+    return df
